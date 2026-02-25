@@ -1,0 +1,35 @@
+{
+  "name": "business-model-lifecycle-auditor",
+  "version": "1.0.0",
+  "description": "Full lifecycle business model auditor: design (Canvas/Lean/VPC), diagnose (unit economics, retention, channels, moat, leverage), fix (pricing architecture, constraints via TOC), and test (experiments, scenarios). Produces a 15-component composite score (0-10), identifies the #1 constraint, and delivers a prioritized action plan with experiment designs. Supports SaaS, marketplace, e-commerce/DTC, agency, info products, and usage-based models.",
+  "author": {
+    "name": "Yassine El Fadili",
+    "email": "yassine@elfadili.com",
+    "url": "https://elfadili.com"
+  },
+  "homepage": "https://skills.sh/ElFadiliY/skills/business-model-lifecycle-auditor",
+  "repository": "https://github.com/ElFadiliY/skills",
+  "license": "MIT",
+  "keywords": [
+    "business-model",
+    "audit",
+    "unit-economics",
+    "pricing",
+    "theory-of-constraints",
+    "startup",
+    "saas",
+    "lean-canvas",
+    "business-model-canvas",
+    "value-proposition-canvas",
+    "churn",
+    "retention",
+    "ltv-cac",
+    "moat",
+    "scale",
+    "hormozi",
+    "goldratt",
+    "osterwalder",
+    "van-westendorp",
+    "experiment-design"
+  ]
+}
