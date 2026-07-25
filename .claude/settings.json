@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "printf '⎇ worktree: %s\\n⎇ branch:   %s\\n' \"$(git rev-parse --show-toplevel 2>/dev/null)\" \"$(git branch --show-current 2>/dev/null)\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/scripts/git-hygiene-report.sh\" 2>/dev/null"
+          }
+        ]
+      }
+    ]
+  }
+}
