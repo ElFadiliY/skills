@@ -1,5 +1,71 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment": [
+    "Canonical agent harness for an Exiid Labs fleet repo. Rolled out from exiid-ops:",
+    "  npm run rollout -- --file scripts/guard-fleet-writes.mjs:.claude/guard-fleet-writes.mjs --file templates/fleet-claude-settings.json:.claude/settings.json",
+    "",
+    "This file is TRACKED on purpose. Permission rules used to live only in the",
+    "workspace root's untracked settings.local.json, which meant any session whose",
+    "project dir was a child repo or a git worktree inherited none of them — that is",
+    "why merges and pushes kept getting blocked in agent sessions that were not",
+    "started from the ops root. Tracked settings follow the repo into every worktree",
+    "and every clone.",
+    "",
+    "Grants here are wide because .claude/guard-fleet-writes.mjs is the real",
+    "enforcement: it parses each command and denies pushes to a protected main,",
+    "force-pushes, --admin merges and repo deletion, snapshots recoverable",
+    "destructive commands to refs/exiid/undo/ instead of blocking them, and",
+    "auto-allows provable reads so they never prompt. Permission patterns are",
+    "prefix-matched and cannot see past `-C <path>`, so they cannot do this job."
+  ],
+  "permissions": {
+    "deny": [
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(**/*.pem)",
+      "Read(**/id_rsa*)",
+      "Edit(**/.env)",
+      "Edit(**/.env.*)",
+      "Write(**/.env)",
+      "Write(**/.env.*)",
+      "Bash(gh secret:*)",
+      "Bash(vercel env pull:*)",
+      "Bash(npx vercel env pull:*)",
+      "Bash(supabase db reset:*)"
+    ],
+    "allow": [
+      "Bash(git -C:*)",
+      "Bash(git push:*)",
+      "Bash(git worktree:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(gh pr comment:*)",
+      "Bash(gh pr ready:*)",
+      "Bash(gh api repos/:*)",
+      "Bash(gh api orgs/:*)",
+      "Bash(gh repo view:*)",
+      "Bash(gh workflow view:*)",
+      "Bash(gh issue list:*)",
+      "Bash(gh issue view:*)",
+      "Bash(npm run:*)",
+      "Bash(npm ci:*)",
+      "Bash(npm test:*)"
+    ]
+  },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/.claude/guard-fleet-writes.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [
@@ -9,7 +75,7 @@
           },
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/scripts/git-hygiene-report.sh\" 2>/dev/null"
+            "command": "d=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}\"; [ -f \"$d/scripts/git-hygiene-report.sh\" ] && bash \"$d/scripts/git-hygiene-report.sh\" 2>/dev/null; true"
           }
         ]
       }
