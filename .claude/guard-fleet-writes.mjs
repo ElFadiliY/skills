@@ -102,6 +102,67 @@ function dirFor(tokens) {
   return payload?.cwd || process.cwd();
 }
 
+// Reduce ONE shell token to the literal argv string bash would hand to git/gh,
+// so the checks below compare against what actually runs — not the raw source.
+// A single outer-quote `.replace` is not shell parsing: bash concatenates
+// adjacent quoted runs (`''main''`, `'m''ain'`, `feature:'main'`), processes
+// ANSI-C `$'…'` escapes (`$'.env'` → `.env`, `$'\x2e\x65\x6e\x76'` → `.env`),
+// and strips backslash escapes (`\main` → `main`). Skipping any of these
+// reopens the quoting bypass the deny/secret gates keep getting probed with.
+// Word-splitting is out of scope (segments are already whitespace-split), so
+// this only collapses quoting/escaping within a single token.
+const shellUnquote = (tok) => {
+  let out = "";
+  for (let i = 0; i < tok.length; ) {
+    const c = tok[i];
+    if (c === "\\") {                       // backslash: next char is literal
+      if (i + 1 < tok.length) { out += tok[i + 1]; i += 2; } else i += 1;
+    } else if (c === "'") {                 // single quotes: everything literal
+      const end = tok.indexOf("'", i + 1);
+      if (end === -1) { out += tok.slice(i + 1); break; }
+      out += tok.slice(i + 1, end); i = end + 1;
+    } else if (c === '"') {                 // double quotes: `\` escapes a few chars
+      i += 1;
+      while (i < tok.length && tok[i] !== '"') {
+        if (tok[i] === "\\" && /["\\$`]/.test(tok[i + 1] ?? "")) { out += tok[i + 1]; i += 2; }
+        else out += tok[i++];
+      }
+      i += 1;
+    } else if (c === "$" && tok[i + 1] === '"') {   // $"…" locale quoting == "…"
+      i += 1;                                        // drop the `$`; next pass reads the `"`
+    } else if (c === "$" && tok[i + 1] === "'") {   // ANSI-C quoting: $'…'
+      i += 2;
+      const simple = { n: "\n", t: "\t", r: "\r", a: "\x07", b: "\b", f: "\f", v: "\v", e: "\x1b", E: "\x1b", "\\": "\\", "'": "'", '"': '"', "?": "?" };
+      while (i < tok.length && tok[i] !== "'") {
+        if (tok[i] !== "\\") { out += tok[i++]; continue; }
+        const n = tok[i + 1];
+        if (n === "x") {                                   // \xHH
+          const m = /^[0-9a-fA-F]{1,2}/.exec(tok.slice(i + 2));
+          if (m) { out += String.fromCharCode(parseInt(m[0], 16)); i += 2 + m[0].length; continue; }
+        }
+        if (n >= "0" && n <= "7") {                        // \nnn octal
+          const m = /^[0-7]{1,3}/.exec(tok.slice(i + 1));
+          out += String.fromCharCode(parseInt(m[0], 8) & 0xff); i += 1 + m[0].length; continue;
+        }
+        if (n in simple) { out += simple[n]; i += 2; continue; }
+        out += n ?? ""; i += 2;                            // unknown escape: drop the `\`
+      }
+      i += 1;                                              // closing '
+    } else {
+      out += c; i += 1;
+    }
+  }
+  return out;
+};
+
+// After shellUnquote has consumed every quote, `\`, and `$'…'`/`$"…"`, a token
+// that STILL carries a `$`-expansion or a backtick is a runtime substitution
+// (`$(…)`, `${…}`, `$VAR`, `` `…` ``) whose value can't be known statically. It
+// could resolve to `main` or to `.env`, so the gates fail closed on it rather
+// than passthrough into a silent settings allow. The `$` must be followed by an
+// identifier/`(`/`{` so a trailing regex anchor (`foo$`) is NOT treated as one.
+const DYNAMIC = /`|\$[\w({]/;
+
 // ═══ 1. DENY — irreversible and outward-facing ═════════════════════════════
 const MAIN = /^(main|master)$/;
 
@@ -159,8 +220,30 @@ function require$(url) {
   } catch { return null; }
 }
 
-for (const seg of segmentsFor("gh")) {
-  if (/^gh\s+pr\s+merge\b/.test(seg) && /\s--admin\b/.test(seg)) {
+// The effective HTTP method of a `gh api` call. Explicit `-X`/`--method` wins in
+// every spelling (`-X DELETE`, `-XDELETE`, `--method=DELETE`). With no method
+// flag, gh sends POST when ANY body/param flag is present (`-f`/`-F`/`--field`/
+// `--raw-field`/`--input`) and GET otherwise — so "no -X" does NOT imply a read.
+const ghMethod = (seg) => {
+  const m = seg.match(/(?:^|\s)(?:-X\s*|--method[=\s]+)([A-Za-z]+)/);
+  if (m) return m[1].toUpperCase();
+  return /(?:^|\s)(?:-f|-F|--field|--raw-field|--input)\b/.test(seg) ? "POST" : "GET";
+};
+// GraphQL is a POST transport whose mutations carry no REST `-X`, so it can never
+// be proven read-only from the command line.
+const ghIsGraphql = (seg) => /^gh\s+api\b/.test(seg) && /(^|\s)graphql(\s|$)/.test(seg);
+// gh's global flags can sit BETWEEN `gh` and the subcommand — `gh -R o/r pr merge
+// --admin` — so an anchored `^gh\s+pr\s+merge` misses them. Strip the value-taking
+// globals (-R/--repo/--hostname) so the subcommand re-anchors to `gh`. The trailing
+// flags the denies care about (`--admin`) sit after the subcommand and survive.
+const ghCanon = (seg) => seg
+  .replace(/(?:^|\s)(?:-R|--repo|--hostname)(?:=\S+|\s+\S+)/g, " ")
+  .replace(/\s+/g, " ")
+  .trim();
+
+for (const raw of segmentsFor("gh")) {
+  const seg = ghCanon(raw);
+  if (/^gh\s+pr\s+merge\b/.test(seg) && /(^|\s)--admin\b/.test(seg)) {
     deny(
       "`gh pr merge --admin` bypasses required status checks — the one thing branch " +
       "protection exists to prevent. Use `gh pr merge --auto --squash` so it lands the " +
@@ -170,34 +253,74 @@ for (const seg of segmentsFor("gh")) {
   if (/^gh\s+repo\s+delete\b/.test(seg)) {
     deny("`gh repo delete` is unrecoverable. Archive instead (AGENTS.md § Archiving), or delete it yourself in the GitHub UI.");
   }
-  if (/^gh\s+api\b/.test(seg) && /(-X|--method)\s+DELETE\b/.test(seg) && /\/?repos\//.test(seg)) {
-    deny("`gh api -X DELETE /repos/…` deletes GitHub state irreversibly. Run it yourself if that is genuinely intended.");
+  if (/^gh\s+api\b/.test(seg)) {
+    const method = ghMethod(seg);
+    if (method === "DELETE" && /\/?repos\//.test(seg)) {
+      deny("`gh api -X DELETE /repos/…` deletes GitHub state irreversibly. Run it yourself if that is genuinely intended.");
+    }
+    // A mutating `gh api` (any non-GET, or any graphql) must not slip through as
+    // passthrough — the wide `Bash(gh api repos/:*)` grant would then run it with
+    // no prompt. Ask so the hook, not the grant, is the gate.
+    if (method !== "GET" || ghIsGraphql(seg)) {
+      ask(
+        `\`gh api\` here issues a ${ghIsGraphql(seg) ? "GraphQL" : method} request, which mutates GitHub state — ` +
+        `the read path auto-allows only GET. Approve deliberately if this change is intended.`,
+      );
+    }
   }
 }
 
 const pushSeg = segmentsFor("git").find((s) => /^git\s+(-C\s+\S+\s+)?push\b/.test(s));
 if (pushSeg) {
-  const tokens = pushSeg.split(/\s+/);
+  // Shell-unquote each token so `origin 'main'`, `''main''`, `'m''ain'`,
+  // `feature:'main'`, `$'main'`, and `\main` all resolve to the branch bash
+  // would pass — a naive quote strip leaves `$`/`\` behind and the deny misses.
+  const tokens = pushSeg.split(/\s+/).map(shellUnquote);
   const dir = dirFor(tokens);
-  const forced = tokens.some((t) => t === "--force" || t === "-f" || t.startsWith("--force-with-lease"));
+  const flags = tokens.filter((t) => t.startsWith("-"));
   const after = tokens.slice(tokens.indexOf("push") + 1).filter((t) => !t.startsWith("-"));
-  const refspecs = after.slice(1); // after[0] is the remote
+  const rawRefspecs = after.slice(1); // after[0] is the remote
   const branch = gitIn(dir, "branch", "--show-current");
 
-  if ((tokens.includes("--delete") || tokens.includes("-d")) && refspecs.some((r) => MAIN.test(r))) {
+  // Force takes four shapes, and the old check caught only two of them:
+  //   --force / --force-with-lease* / --force-if-includes*   (long)
+  //   -f, and short clusters that bury it (-fu, -uf)          (short)
+  //   a leading '+' on any refspec forces just that ref       (per-refspec)
+  const forced =
+    flags.some((t) => t === "--force" || t.startsWith("--force-with-lease") || t.startsWith("--force-if-includes")) ||
+    flags.some((t) => /^-[a-z]*f/.test(t)) ||
+    rawRefspecs.some((r) => r.startsWith("+"));
+  const deleting = flags.some((t) => t === "--delete") || flags.some((t) => /^-[a-z]*d/.test(t));
+
+  // `--all`, `--mirror`, `--branches` push every local branch (main included)
+  // with no explicit refspec, so the refspec-derived `targets` below stay empty
+  // and fall back to the current branch — main slips past the protected deny.
+  // Treat them as touching main so the protected-repo gate still fires.
+  const pushAll = flags.some((t) => t === "--all" || t === "--mirror" || t === "--branches");
+
+  // Normalise a refspec to its destination branch: drop a leading '+', take the
+  // right side of a `src:dst`, resolve HEAD, and strip a `refs/heads/` prefix so
+  // `+main`, `HEAD:refs/heads/main` and `main` all collapse to `main`.
+  const destOf = (r) => {
+    const bare = r.replace(/^\+/, "");
+    const dst = bare.includes(":") ? bare.split(":").pop() : bare === "HEAD" ? branch : bare;
+    return dst.replace(/^refs\/heads\//, "");
+  };
+  const refspecs = rawRefspecs.map(destOf);
+
+  if (deleting && refspecs.some((r) => MAIN.test(r))) {
     deny("Refusing to delete the `main` branch on the remote.");
   }
-  if (refspecs.some((r) => /^:(main|master)$/.test(r))) {
+  if (rawRefspecs.some((r) => /^:(refs\/heads\/)?(main|master)$/.test(r))) {
     deny("Refusing to delete the `main` branch on the remote (`:main` refspec).");
   }
 
-  const targets = refspecs.length
-    ? refspecs.map((r) => (r.includes(":") ? r.split(":").pop() : r === "HEAD" ? branch : r))
-    : [branch];
-  const touchesMain = targets.some((t) => MAIN.test(t));
+  const targets = refspecs.length ? refspecs : [branch];
+  const touchesMain = targets.some((t) => MAIN.test(t)) || pushAll;
 
   if (forced && touchesMain) {
-    deny(`Refusing to force-push to \`${targets.find((t) => MAIN.test(t))}\`. Shared history is never rewritten in this fleet.`);
+    const mainTarget = targets.find((t) => MAIN.test(t)) ?? "main";
+    deny(`Refusing to force-push to \`${mainTarget}\`. Shared history is never rewritten in this fleet.`);
   }
   if (touchesMain) {
     const protectedRepos = protectedSet();
@@ -209,8 +332,31 @@ if (pushSeg) {
       );
     }
   }
+  // Force-push to a NON-main branch. Denying this outright was wrong: updating
+  // your own PR branch after a rebase is routine, and the deny made the normal
+  // workflow impossible rather than safer (it blocked this very repo's
+  // maintainer mid-session). `--force-with-lease`/`--force-if-includes` are the
+  // safe forms — they refuse if the remote moved under you, so they cannot
+  // silently clobber someone else's push. Bare `--force` has no such check, so
+  // it still wants a human.
   if (forced) {
-    deny(`Refusing to force-push \`${targets.join(", ")}\`. Push a fresh branch and open a PR instead.`);
+    const leased = flags.some((t) => t.startsWith("--force-with-lease") || t.startsWith("--force-if-includes"));
+    if (!leased) {
+      ask(
+        `\`git push --force\` to \`${targets.join(", ")}\` overwrites the remote branch with no check ` +
+        `that it still points where you think. Use \`--force-with-lease\`, which refuses if someone ` +
+        `else pushed in the meantime, and needs no approval.`,
+      );
+    }
+  }
+  // A refspec whose destination is a runtime expansion (`$(…)`, `${…}`, `$VAR`,
+  // backticks) can resolve to protected `main`, and the parse can't prove it
+  // won't. Don't let it fall through to a silent `Bash(git push:*)` allow.
+  if (rawRefspecs.some((r) => DYNAMIC.test(r))) {
+    ask(
+      "This push refspec resolves at runtime (`$…`, `$(…)`, `${…}`, or backticks), so its " +
+      "destination — possibly protected `main` — can't be verified here. Approve only if it is not main.",
+    );
   }
 }
 
@@ -258,6 +404,39 @@ if (addSeg) {
         `\n\nStaging by name avoids this — it is what would have prevented #6.`,
       );
     }
+  }
+}
+
+// `fetch <src>:<dst>` writes local refs and bare `stash` moves the working tree.
+// Neither is a read, so the read path (§4) leaves them as passthrough — but the
+// wide `Bash(git -C:*)` grant would then run them with no prompt. Ask here so the
+// hook is the gate. `git fetch` with no refspec (updates only remote-tracking
+// refs) and `stash list`/`show` stay silent.
+const fetchSeg = segmentsFor("git").find((s) => /^git\s+(-C\s+\S+\s+)?fetch\b/.test(s));
+if (fetchSeg) {
+  const rest = fetchSeg.replace(/^git\s+(-C\s+\S+\s+)?fetch\b/, "");
+  if (/(^|\s)\+?[^\s:]*:[^\s]+/.test(rest) || /--update-head-ok\b/.test(rest)) {
+    ask(
+      "`git fetch` with a `src:dst` refspec updates local branches (and a leading `+` or " +
+      "--update-head-ok force-updates them). Approve deliberately; a bare `git fetch` only " +
+      "moves remote-tracking refs and needs no prompt.",
+    );
+  }
+}
+const stashSeg = segmentsFor("git").find((s) => /^git\s+(-C\s+\S+\s+)?stash\b/.test(s));
+if (stashSeg) {
+  const sub = stashSeg.replace(/^git\s+(-C\s+\S+\s+)?stash\b/, "").trim().split(/\s+/)[0] || "";
+  // Only the forms that DESTROY stashed work need a human. `push`/`save` (and
+  // bare `stash`) are the opposite of destructive — the stash is a recovery
+  // mechanism, and this hook's own deny/ask messages tell you to "stash first".
+  // Gating the remedy it recommends is the friction this guard exists to remove.
+  // `pop`/`apply` can conflict but never lose data; git refuses rather than
+  // clobbering.
+  if (/^(drop|clear)$/.test(sub)) {
+    ask(
+      "`git stash drop` / `clear` permanently discards stashed work — it is not in any branch, " +
+      "so there is nothing to recover it from. `git stash list` / `show` inspect it first.",
+    );
   }
 }
 
@@ -344,20 +523,31 @@ if (localSeg) {
 // Skips the permission prompt entirely, so this must be exact. Anything with a
 // redirect, command substitution, backticks or a subshell is disqualified
 // outright: those can hide arbitrary writes behind a read-looking command.
-if (/[><`]|\$\(|\bsudo\b/.test(rawCmd)) passthrough();
+// `2>&1`, `>/dev/null` and `2>/dev/null` are not writes — they discard or merge
+// streams. Treating every `>` as a file write disqualified the single most
+// common shape in agent sessions (`cmd 2>&1 | tail`), which then fell through to
+// a prompt for what was a pure read. Strip those three forms first, then apply
+// the real check: any REMAINING redirect can create or truncate a file.
+const redirectProbe = rawCmd
+  .replace(/\d?>&\d/g, " ")
+  .replace(/\d?>>?\s*\/dev\/(null|stderr|stdout)\b/g, " ");
+if (/[><`]|\$\(|\bsudo\b/.test(redirectProbe)) passthrough();
 
 const GIT_READ = new Set(["status", "log", "diff", "show", "rev-parse", "rev-list", "ls-files",
   "ls-remote", "ls-tree", "cat-file", "cherry", "for-each-ref", "merge-base", "describe", "blame",
   "shortlog", "count-objects", "symbolic-ref", "whatchanged", "fetch", "remote", "worktree",
   "stash", "branch", "tag", "config", "grep", "show-ref", "reflog", "diff-tree", "name-rev"]);
 // Subcommand-level exceptions: these verbs mutate.
-const GIT_READ_UNSAFE = /^(remote\s+(add|remove|rm|set-url|rename|prune)|worktree\s+(add|remove|prune|move|lock)|stash\s+(push|pop|apply|drop|clear|save)|branch\s+(-d|-D|-m|-M|--delete|--move|--set-upstream|-u)|tag\s+(-d|--delete|-a|-s|-f)|config\s+(?!--get|--list|-l)|reflog\s+(expire|delete))/;
+// `stash` alone means `stash push` in modern git — it moves the working tree.
+// Only `stash list` / `stash show` are reads, so treat every other stash form
+// (bare `stash` included) as unsafe.
+const GIT_READ_UNSAFE = /^(remote\s+(add|remove|rm|set-url|rename|prune)|worktree\s+(add|remove|prune|move|lock)|stash(?!\s+(list|show)\b)|branch\s+(-d|-D|-m|-M|--delete|--move|--set-upstream|-u)|tag\s+(-d|--delete|-a|-s|-f)|config\s+(?!--get|--list|-l)|reflog\s+(expire|delete))/;
 
-const GH_READ = /^gh\s+(pr\s+(view|list|checks|diff|status)|run\s+(list|view|watch)|repo\s+(view|list)|issue\s+(view|list)|workflow\s+(list|view)|release\s+(view|list)|api\s+(?!.*(-X|--method)\s+(?!GET))|search|auth\s+status|label\s+list|cache\s+list|status)\b/;
+const GH_READ = /^gh\s+(pr\s+(view|list|checks|diff|status)|run\s+(list|view|watch)|repo\s+(view|list)|issue\s+(view|list)|workflow\s+(list|view)|release\s+(view|list)|search|auth\s+status|label\s+list|cache\s+list|status)\b/;
 
 const NPM_READ = /^npm\s+run\s+(-s\s+|--silent\s+)?(doctor|validate|audit|lint|typecheck|test|brief|guard|secrets|drift|status|harvest|roadmap|dashboard|generate|tidy|undo)\b/;
 
-const SHELL_READ = new Set(["ls", "cat", "head", "tail", "wc", "grep", "rg", "fd", "find", "jq",
+const SHELL_READ = new Set(["ls", "cat", "head", "tail", "wc", "grep", "rg", "jq",
   "diff", "cmp", "file", "stat", "du", "df", "basename", "dirname", "realpath", "pwd", "echo",
   "printf", "sort", "uniq", "cut", "tr", "which", "type", "date", "true", "seq", "column", "tee"]);
 
@@ -365,18 +555,144 @@ const isReadOnly = (seg) => {
   const t = seg.split(/\s+/);
   const bin = t[0];
   if (bin === "cd") return true;                              // navigation alone changes nothing
+  // find/fd are not reads — they can run arbitrary commands (-exec/-x) and delete
+  // (-delete). Auto-allow only the pure-traversal form; a segment carrying any
+  // action flag falls through to the normal permission prompt.
+  if (bin === "find") return !/(^|\s)-(exec(dir)?|ok(dir)?|delete|fprintf?|fls)\b/.test(seg);
+  if (bin === "fd")   return !/(^|\s)(-x|-X|--exec(-batch)?)\b/.test(seg);
+  // `sort -o FILE` / `sort -oFILE` / `sort --output` overwrites a file in place.
+  if (bin === "sort") return !t.slice(1).some((a) => /^--output(=|$)/.test(a) || /^-[a-z]*o/.test(a));
   if (SHELL_READ.has(bin)) return bin !== "tee";              // tee writes — excluded
   if (bin === "npm") return NPM_READ.test(seg);
-  if (bin === "gh") return GH_READ.test(seg);
+  if (bin === "gh") {
+    // Canonicalise away global flags (`-R o/r`, `--hostname …`) so a GET behind
+    // them still reads as read-only. `gh api` is read-only only for a REST GET
+    // (explicit or bodyless default); graphql and any body/method that implies
+    // non-GET mutate. Every other GH_READ verb is inherently read.
+    const g = ghCanon(seg);
+    if (/^gh\s+api\b/.test(g)) return !ghIsGraphql(g) && ghMethod(g) === "GET";
+    return GH_READ.test(g);
+  }
   if (bin === "git") {
     const rest = t[1] === "-C" ? t.slice(3).join(" ") : t.slice(1).join(" ");
     const sub = rest.split(/\s+/)[0];
     if (!GIT_READ.has(sub)) return false;
     if (GIT_READ_UNSAFE.test(rest)) return false;
+    // `git fetch` with a colon refspec (`main:main`, `+main:main`) or
+    // --update-head-ok updates local refs — that is a write, not a read.
+    if (sub === "fetch" && (/(^|\s)\+?[^\s:]*:[^\s]+/.test(rest) || /--update-head-ok\b/.test(rest))) return false;
     return true;
   }
   return false;
 };
+
+// A content-dumping read (cat/head/rg/grep/…) aimed at a secret path would
+// otherwise be auto-allowed below and skip the prompt — the very files the
+// Read(**/.env*) and key denials block. The deny list must not have a Bash side
+// door, so route these to a human. `ask` restores exactly the gate that
+// auto-allow removed; a deliberate operator can still approve.
+const SECRET_READ_PATHS = SENSITIVE.filter(([, why]) => !/personal document/.test(why)).map(([re]) => re);
+const isSecretPath = (p) => SECRET_READ_PATHS.some((re) => re.test(p));
+// A git pathspec can carry a rev prefix — `HEAD:.env`, `:0:.env`, `:.env` — that
+// hides the real path from the `(^|/)\.env` shapes. Shell-unquote first so any
+// quoting/escaping bash would collapse (`HEAD:''.env''`, `HEAD:.en''v`,
+// `HEAD:$'.env'`) is gone, then drop the rev prefix so only the bare path is
+// left to match.
+const bareGitPath = (a) => shellUnquote(a).replace(/^[^:]*:(?:[0-3]:)?/, "");
+
+const CONTENT_READERS = new Set(["cat", "head", "tail", "less", "more", "nl", "tac",
+  "xxd", "od", "strings", "hexdump", "grep", "rg", "jq", "sort", "cut", "tr", "wc"]);
+// git verbs that print file CONTENTS (not just names/status). `git show HEAD:.env`
+// and `git grep SECRET -- .env` are reads that GIT_READ would otherwise auto-allow,
+// so they need the same secret gate as the shell dumpers above.
+const GIT_CONTENT_READERS = new Set(["show", "grep", "cat-file", "diff", "diff-tree", "blame", "log"]);
+
+for (const seg of segments) {
+  const st = seg.split(/\s+/);
+  const bin = st[0];
+  let cands = null;
+  if (CONTENT_READERS.has(bin)) {
+    cands = st.slice(1).filter((a) => !a.startsWith("-")).map(shellUnquote);
+  } else if (bin === "git") {
+    const rest = st[1] === "-C" ? st.slice(3) : st.slice(1);
+    if (GIT_CONTENT_READERS.has(rest[0])) {
+      // Treat every non-flag arg as a candidate pathspec (positional `<file>`,
+      // `<rev>:<path>`, and args after `--` all count). `grep`'s search pattern
+      // is swept in too, but it only trips the gate if the pattern itself looks
+      // like a secret path — a rare, harmless extra prompt.
+      cands = rest.slice(1)
+        .filter((a) => !a.startsWith("-") && a !== "--")
+        .map(bareGitPath);
+    }
+  }
+  if (!cands) continue;
+  const hit = cands.find(isSecretPath);
+  if (hit) {
+    ask(
+      `Reading \`${hit}\` via \`${bin}\` would expose a file the Read/.env deny list forbids — ` +
+      `secrets get no Bash side door. Approve deliberately only if you genuinely need it.`,
+    );
+  }
+  // A path arg that still expands at runtime (`$(…)`, `${…}`, `$VAR`, backticks)
+  // after shellUnquote could resolve to `.env`/a key — the exact obfuscation
+  // this gate stops. Fail closed rather than let it reach the read-only `allow`
+  // that skips the prompt entirely.
+  const dyn = cands.find((p) => DYNAMIC.test(p));
+  if (dyn) {
+    ask(
+      `A path arg to \`${bin}\` expands at runtime (\`${dyn}\`), so it can't be checked against the ` +
+      `secret deny list — it may resolve to \`.env\` or a key. Approve only if you know it does not.`,
+    );
+  }
+}
+
+// ═══ 5. ALLOW — safe writes, including in a chain ══════════════════════════
+// Permission patterns are prefix-matched against the WHOLE command string, so
+// `gh pr merge 23 --squash` matches `Bash(gh pr merge:*)` but
+// `cd /repo && gh pr merge 23 --squash` matches nothing and falls to the
+// classifier. That one difference is the single biggest source of "blocked
+// again" in agent sessions, and no allowlist entry can fix it — only something
+// that parses the chain can.
+//
+// Every dangerous form of these verbs has already been denied or asked above,
+// so what reaches here is the residue: the safe cases. Granting them is not a
+// new permission, it is the same policy applied to a chain instead of a bare
+// command.
+const SAFE_WRITE = (seg) => {
+  const t = seg.split(/\s+/);
+  if (t[0] === "gh") {
+    const g = ghCanon(seg);
+    // --admin was denied in §1; everything reaching here respects the checks.
+    return /^gh\s+(pr\s+(create|merge|edit|comment|ready|close|reopen)|issue\s+(create|comment|edit)|run\s+(rerun|cancel))\b/.test(g);
+  }
+  if (t[0] === "git") {
+    const rest = t[1] === "-C" ? t.slice(3).join(" ") : t.slice(1).join(" ");
+    const sub = rest.split(/\s+/)[0];
+    // Pushes to a protected main, force-pushes and main deletions are already
+    // denied/asked in §1 — a push still standing here targets a feature branch.
+    if (sub === "push") return true;
+    // add/commit: a bulk add staging a secret was asked in §2.
+    if (sub === "add" || sub === "commit") return true;
+    if (sub === "checkout" || sub === "switch" || sub === "restore" || sub === "reset") return true;
+    if (sub === "merge" || sub === "rebase" || sub === "cherry-pick" || sub === "revert") return true;
+    if (sub === "pull") return true;                  // fetch + merge; recoverable
+    if (sub === "stash") return true;                 // drop/clear asked above
+    if (sub === "fetch") return true;
+    // Creating/listing branches, tags and worktrees is routine; DELETING them
+    // is not, and a `-D` can drop unmerged commits (reflog-only recovery). Let
+    // the destructive subforms fall through to a prompt rather than riding in
+    // on the chain grant.
+    if (sub === "branch")   return !/(^|\s)(-d|-D|--delete|-m|-M|--move)\b/.test(rest);
+    if (sub === "tag")      return !/(^|\s)(-d|--delete)\b/.test(rest);
+    if (sub === "worktree") return !/(^|\s)(remove|prune)\b/.test(rest);
+    return false;
+  }
+  return false;
+};
+
+if (segments.length && segments.every((s) => isReadOnly(s) || SAFE_WRITE(s))) {
+  allow(segments.every(isReadOnly) ? "read-only" : "read-only + already-vetted git/gh writes");
+}
 
 if (segments.length && segments.every(isReadOnly)) {
   allow("read-only");
