@@ -12,6 +12,15 @@ Labs repos except the script below — no central store, no keyring. Full conven
 ./scripts/env.sh exec -- npm run dev      # run something with this repo's env loaded
 ```
 
+A key must be **declared in a committed `.env.example`** before a value can be stored for it.
+A brand-new key is two steps:
+
+```bash
+./scripts/env.sh set --declare NEW_KEY    # writes the name, never a value
+git commit .env.example -m "declare NEW_KEY"
+./scripts/env.sh set NEW_KEY              # now the value
+```
+
 `set` reads the value at a hidden prompt: no echo, no shell history. Piping works too, for a
 password manager:
 
@@ -38,11 +47,16 @@ write on `.env*` on purpose, and this flow means that never has to be relaxed.
 
 ## Rules
 
-- **`.env.example` is the contract.** Every variable this repo reads, no real values, a
-  one-line comment each. `set` appends a placeholder for any name it doesn't find there, so
-  the file cannot silently fall behind — fill in the comment and commit it.
+- **`.env.example` is the contract — and the allowlist.** Every variable this repo reads, no
+  real values, a one-line comment each. A name that isn't committed there can neither be `set`
+  nor loaded by `exec`.
+- **`exec` never sources the env file.** It parses line by line and exports only committed,
+  declared names. Sourcing would run every value as shell code — and the file it would run is
+  exactly the one this tool writes, which is the attack the whole design is guarding against.
+  A denylist of dangerous names is unbounded; your `.env.example` is finite and shows up in a
+  diff.
 - **Never commit a real value.** The script gitignores its target before writing, and refuses
-  outright if the target is a tracked file.
+  outright if the target is tracked, symlinked, or hard-linked.
 - **Fail loudly at startup** on a missing required key, never deep inside a request.
 - **`NEXT_PUBLIC_` / `VITE_` / `PUBLIC_` ships to the browser.** Not a secret; never put one
   there.
