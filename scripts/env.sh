@@ -429,7 +429,19 @@ cmd_unset() {
     echo "${D}$name is not set in $TARGET.${N}"; return 0
   fi
   tmp="$(mktemp)"
-  grep -vE "^[[:space:]]*(export[[:space:]]+)?${name}=" "$TARGET" > "$tmp" && mv "$tmp" "$TARGET"
+  grep -vE "^[[:space:]]*(export[[:space:]]+)?${name}=" "$TARGET" > "$tmp"
+  rc=$?
+  # grep exits 1 when it selects NOTHING — which is the ordinary result of
+  # unsetting the file's only key, not a failure. Gating `mv` on grep's exit
+  # status (`… > "$tmp" && mv …`) therefore skipped the move in exactly that
+  # case and left the secret in place while printing "removed". Only >1 is a
+  # real error.
+  if [ "$rc" -gt 1 ]; then
+    rm -f "$tmp"
+    echo "${R}✗${N} could not rewrite $TARGET — left untouched." >&2
+    return 1
+  fi
+  mv "$tmp" "$TARGET"
   chmod 600 "$TARGET"
   echo "${G}✓${N} removed $name from $TARGET"
 }
