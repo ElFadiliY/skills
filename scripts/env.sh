@@ -161,7 +161,6 @@ cmd_set() {
     *) echo "${R}✗${N} '$name' is not a valid env var name" >&2; return 1 ;;
   esac
   pick_target
-  ensure_ignored "$TARGET" || return 1
 
   if [ -t 0 ]; then
     printf 'Value for %s (input hidden, not echoed): ' "$name"
@@ -176,6 +175,11 @@ cmd_set() {
   fi
   value="$(printf '%s' "$value" | tr -d '\r\n')"
   if [ -z "$value" ]; then echo "${R}✗${N} empty value — nothing written." >&2; return 1; fi
+
+  # Only now, with a value in hand, touch anything on disk. Doing the gitignore
+  # edit before the prompt meant aborting at the prompt still left a stray line
+  # behind — a write with nothing to show for it.
+  ensure_ignored "$TARGET" || return 1
 
   # Quote only when the value contains something a dotenv parser could misread.
   # Plain API keys and URLs stay unquoted, which every parser here handles.
@@ -229,6 +233,14 @@ cmd_unset() {
 
 cmd_check() {
   pick_target
+  # No contract to check against is not the same as a passing check. Saying "✓"
+  # here would be a vacuous truth, and a green that means nothing is worse than
+  # a red — it teaches you to stop reading the output.
+  if [ ! -f "$EXAMPLE" ]; then
+    echo "${Y}!${N} no $EXAMPLE — nothing declared, so there is nothing to check."
+    echo "  ${D}./scripts/env.sh scan lists what the code actually reads.${N}"
+    return 0
+  fi
   missing=""
   while IFS= read -r k; do
     [ -n "$k" ] || continue
