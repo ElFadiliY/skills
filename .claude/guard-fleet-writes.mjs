@@ -176,10 +176,15 @@ const MAIN = /^(main|master)$/;
 // (one regex, no yaml dependency), and only then to a baked-in list. Never to
 // empty. The baked list is the last resort and can go stale, which is why it
 // is checked last and named as such.
-const BAKED_PROTECTED = ["dentistry-lms", "billing-platform", "iqa-contribution", "dentistry-leads", "exiid-os"];
+const BAKED_PROTECTED = ["dentistry-lms", "billing-platform", "iqa-contribution", "dentistry-leads", "exiid-os", "carwella"];
 
 function protectedSet() {
-  // 1. Running inside exiid-ops: the manifest module is authoritative.
+  // 1. Running inside exiid-ops: the manifest module is authoritative, and
+  //    deliberately independent of cwd — this file's own location fixes the
+  //    root, so a session anywhere on the box gets the live protected set
+  //    rather than the baked one. In a rolled-out copy (<repo>/.claude/) the
+  //    sibling `lib/manifest.mjs` does not exist, so this tier is skipped
+  //    outright and the walk-up below takes over.
   try {
     const url = new URL("./lib/manifest.mjs", import.meta.url);
     if (existsSync(url)) {
@@ -212,9 +217,18 @@ function protectedSet() {
 // Synchronous import of the manifest module is not possible from ESM, so read
 // and regex the same file the module would have parsed. Keeps protectedSet()
 // synchronous and dependency-free in every repo it lands in.
+//
+// `url` is the manifest MODULE (`<root>/scripts/lib/manifest.mjs`), so the
+// manifest FILE is two levels up, exactly as manifest.mjs's own ROOT computes
+// it. This read `../workspace.yaml` until 2026-07-27 — i.e. `scripts/
+// workspace.yaml`, which cannot exist — so step 1 always returned null and the
+// documented "the manifest module is authoritative" order was a fiction. It
+// went unnoticed because step 2's walk up from cwd covers every in-tree
+// session; only out-of-tree callers felt it, and they silently got the
+// stale-able baked list instead.
 function require$(url) {
   try {
-    const src = readFileSync(new URL("../workspace.yaml", url), "utf8");
+    const src = readFileSync(new URL("../../workspace.yaml", url), "utf8");
     const m = src.match(/^\s*protected_repos:\s*\[([^\]]+)\]/m);
     return m ? m[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "").toLowerCase()).filter(Boolean) : null;
   } catch { return null; }
