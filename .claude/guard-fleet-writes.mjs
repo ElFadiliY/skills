@@ -176,7 +176,7 @@ const MAIN = /^(main|master)$/;
 // (one regex, no yaml dependency), and only then to a baked-in list. Never to
 // empty. The baked list is the last resort and can go stale, which is why it
 // is checked last and named as such.
-const BAKED_PROTECTED = ["dentistry-lms", "billing-platform", "iqa-contribution", "dentistry-leads", "exiid-os", "carwella"];
+const BAKED_PROTECTED = ["dentistry-lms", "billing-platform", "iqa-contributions", "dentistry-leads", "exiid-os", "carwella"];
 
 function protectedSet() {
   // 1. Running inside exiid-ops: the manifest module is authoritative, and
