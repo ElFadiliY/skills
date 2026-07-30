@@ -652,6 +652,62 @@ const isReadOnly = (seg) => {
 // auto-allow removed; a deliberate operator can still approve.
 const SECRET_READ_PATHS = SENSITIVE.filter(([, why]) => !/personal document/.test(why)).map(([re]) => re);
 const isSecretPath = (p) => SECRET_READ_PATHS.some((re) => re.test(p));
+
+// Concrete names the SENSITIVE shapes are meant to protect. Used to decide
+// whether a shell PATTERN could land on one of them — see globCouldHitSecret.
+// Names, not paths: the patterns above are anchored on `(^|/)`, so a bare
+// filename exercises them exactly as a nested one would.
+const SECRET_EXEMPLARS = [
+  ".env", ".env.local", ".env.production",
+  "server.pem", "tls.key", "cert.p12", "store.pfx", "keys.jks", "a.keystore",
+  "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+  ".npmrc", ".netrc", ".pypirc",
+  "credentials", "credentials.json", "credential.json",
+  "service_account.json", "service-account-key.json",
+  ".terraformrc", ".terraform", "main.tfstate",
+];
+
+// Does this token contain shell pathname-expansion metacharacters?
+const HAS_GLOB = /[*?[\]{}]/;
+
+/**
+ * True when `tok` is a shell pattern that could expand onto a secret file.
+ *
+ * Translating the glob to a regex and testing it against known secret names is
+ * deliberately narrower than "any pattern is suspicious": `scripts/*.mjs`
+ * matches no exemplar and stays silent, while `.en*`, `.en{v}`, `*.pem` and
+ * `id_*` all match and fail closed. Bounded and allocation-free — no filesystem
+ * access, so it cannot be defeated by the file being absent at check time and
+ * cannot hang on a large tree.
+ */
+function globCouldHitSecret(tok) {
+  if (!tok || !HAS_GLOB.test(tok)) return false;
+  const base = tok.split("/").pop() ?? tok;
+  if (!HAS_GLOB.test(base)) return false; // pattern is in a directory part only
+
+  let re = "";
+  for (let i = 0; i < base.length; i++) {
+    const c = base[i];
+    if (c === "*") re += "[^/]*";
+    else if (c === "?") re += "[^/]";
+    else if (c === "[") {                       // character class: pass through
+      const end = base.indexOf("]", i + 1);
+      if (end === -1) { re += "\\["; continue; }
+      re += `[${base.slice(i + 1, end).replace(/^!/, "^")}]`;
+      i = end;
+    } else if (c === "{") {                     // brace list -> alternation
+      const end = base.indexOf("}", i + 1);
+      if (end === -1) { re += "\\{"; continue; }
+      const parts = base.slice(i + 1, end).split(",").map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      re += `(?:${parts.join("|")})`;
+      i = end;
+    } else re += c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  let pattern;
+  try { pattern = new RegExp(`^${re}$`, "i"); } catch { return true; } // unparseable -> fail closed
+  return SECRET_EXEMPLARS.some((name) => pattern.test(name));
+}
 // A git pathspec can carry a rev prefix — `HEAD:.env`, `:0:.env`, `:.env` — that
 // hides the real path from the `(^|/)\.env` shapes. Shell-unquote first so any
 // quoting/escaping bash would collapse (`HEAD:''.env''`, `HEAD:.en''v`,
@@ -701,6 +757,25 @@ for (const seg of segments) {
     ask(
       `A path arg to \`${bin}\` expands at runtime (\`${dyn}\`), so it can't be checked against the ` +
       `secret deny list — it may resolve to \`.env\` or a key. Approve only if you know it does not.`,
+    );
+  }
+  // PATHNAME expansion is the same hole by another route, and it was open:
+  // `cat .env` correctly asked while `cat .en*` and `cat .en{v}` were ALLOWED
+  // outright — allow skips the prompt entirely, so a glob read a secret with
+  // nothing shown to the operator. (Found by probing this guard against
+  // dentistry-lms's copy, which had already closed it in #1072/#1074.)
+  //
+  // Blanket-asking on every `*` would undo the ergonomics rule this file exists
+  // for — `cat scripts/*.mjs` must stay silent. So ask only when the pattern
+  // could actually REACH something sensitive: expand it as a regex and test it
+  // against the canonical secret filenames. `.en*` -> /^\.en.*$/ matches
+  // `.env`; `scripts/*.mjs` matches none of them.
+  const globby = cands.find((p) => globCouldHitSecret(p));
+  if (globby) {
+    ask(
+      `A path arg to \`${bin}\` is a shell pattern (\`${globby}\`) that could expand onto a file the ` +
+      `secret deny list forbids (\`.env\`, a key, credentials). Name the file explicitly, or approve ` +
+      `only if you know what it matches.`,
     );
   }
 }
