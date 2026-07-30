@@ -63,18 +63,60 @@ if (payload?.tool_name !== "Bash") passthrough();
 const rawCmd = String(payload?.tool_input?.command ?? "");
 if (!rawCmd) passthrough();
 
+// After shellUnquote (below) has consumed every quote, `\`, and `$'…'`/`$"…"`, a
+// token that STILL carries a `$`-expansion or a backtick is a runtime
+// substitution whose value cannot be known statically. The heredoc scrub below
+// applies the same fail-closed test to expandable heredoc bodies.
+const DYNAMIC = /`|\$[\w({]/;
+
 // Text that merely CONTAINS a dangerous command is not that command. A commit
 // message describing `gh pr merge --admin`, a heredoc writing docs, an `echo`
 // of an example — all matched the naive regex and blocked honest work (this
 // file's own first commit was the casualty). Scrub the prose regions before
 // matching, and require a segment to actually START with the binary.
-const cmd = rawCmd
-  .replace(/<<-?\s*(['"]?)([A-Za-z_]\w*)\1[\s\S]*?^\s*\2\s*$/gm, " <<HEREDOC ")
-  .replace(/<<-?\s*(['"]?)([A-Za-z_]\w*)\1[\s\S]*$/m, " <<HEREDOC ")
+// Scrub only heredoc bodies. The marker must not itself contain `<<` (or a
+// second pass can eat later commands), and same-line operators after the
+// closing tag must survive for the irreversible-action checks.
+const HEREDOC = /<<-?[ \t]*(['"]?)([A-Za-z_]\w*)\1([^\n]*)(?:\n([\s\S]*?)^[ \t]*\2[ \t]*$|\n([\s\S]*)$|$)/gm;
+let heredocDynamic = null;
+const scrubHeredocs = (src) => src.replace(HEREDOC, (_m, quoted, _tag, suffix, body, unterminated) => {
+  const text = body ?? unterminated ?? "";
+  if (!quoted && !heredocDynamic && DYNAMIC.test(text)) {
+    heredocDynamic = text.trim().split("\n")[0].slice(0, 120);
+  }
+  return ` HEREDOC_BODY ${suffix} `;
+});
+
+const cmd = scrubHeredocs(rawCmd)
   .replace(/(^|\s)(-m|--message)\s+("(?:[^"\\]|\\.)*"|'[^']*')/g, "$1$2 MSG");
 
 const SEP = /\s*(?:\|\||&&|;|\||\n)\s*/;
-const segments = cmd.split(SEP)
+// Split only on shell operators outside quotes. A bare regex split cuts the
+// `|` inside `rg 'SECRET|TOKEN' .env` and can hide the sensitive path.
+const splitSegments = (src) => {
+  const out = [];
+  let buf = "";
+  let quote = null;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (quote) {
+      buf += c;
+      if (quote === '"' && c === "\\" && i + 1 < src.length) buf += src[++i];
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === "\\" && i + 1 < src.length) { buf += c + src[++i]; continue; }
+    if (c === "'" || c === '"') { quote = c; buf += c; continue; }
+    if (c === "\n" || c === ";") { out.push(buf); buf = ""; continue; }
+    if (c === "|") { out.push(buf); buf = ""; if (src[i + 1] === "|") i++; continue; }
+    if (c === "&" && src[i + 1] === "&") { out.push(buf); buf = ""; i++; continue; }
+    buf += c;
+  }
+  out.push(buf);
+  return quote ? null : out;
+};
+
+const segments = (splitSegments(cmd) ?? cmd.split(SEP))
   .map((s) => s.trim().replace(/^(?:[A-Za-z_]\w*=\S*\s+)*/, "")) // strip FOO=bar prefixes
   .filter(Boolean);
 const segmentsFor = (bin) => segments.filter((s) => s === bin || s.startsWith(`${bin} `));
@@ -155,14 +197,6 @@ const shellUnquote = (tok) => {
   return out;
 };
 
-// After shellUnquote has consumed every quote, `\`, and `$'…'`/`$"…"`, a token
-// that STILL carries a `$`-expansion or a backtick is a runtime substitution
-// (`$(…)`, `${…}`, `$VAR`, `` `…` ``) whose value can't be known statically. It
-// could resolve to `main` or to `.env`, so the gates fail closed on it rather
-// than passthrough into a silent settings allow. The `$` must be followed by an
-// identifier/`(`/`{` so a trailing regex anchor (`foo$`) is NOT treated as one.
-const DYNAMIC = /`|\$[\w({]/;
-
 // ═══ 1. DENY — irreversible and outward-facing ═════════════════════════════
 const MAIN = /^(main|master)$/;
 
@@ -176,10 +210,15 @@ const MAIN = /^(main|master)$/;
 // (one regex, no yaml dependency), and only then to a baked-in list. Never to
 // empty. The baked list is the last resort and can go stale, which is why it
 // is checked last and named as such.
-const BAKED_PROTECTED = ["dentistry-lms", "billing-platform", "iqa-contribution", "dentistry-leads", "exiid-os"];
+const BAKED_PROTECTED = ["dentistry-lms", "billing-platform", "iqa-contributions", "dentistry-leads", "exiid-os", "carwella"];
 
 function protectedSet() {
-  // 1. Running inside exiid-ops: the manifest module is authoritative.
+  // 1. Running inside exiid-ops: the manifest module is authoritative, and
+  //    deliberately independent of cwd — this file's own location fixes the
+  //    root, so a session anywhere on the box gets the live protected set
+  //    rather than the baked one. In a rolled-out copy (<repo>/.claude/) the
+  //    sibling `lib/manifest.mjs` does not exist, so this tier is skipped
+  //    outright and the walk-up below takes over.
   try {
     const url = new URL("./lib/manifest.mjs", import.meta.url);
     if (existsSync(url)) {
@@ -212,9 +251,18 @@ function protectedSet() {
 // Synchronous import of the manifest module is not possible from ESM, so read
 // and regex the same file the module would have parsed. Keeps protectedSet()
 // synchronous and dependency-free in every repo it lands in.
+//
+// `url` is the manifest MODULE (`<root>/scripts/lib/manifest.mjs`), so the
+// manifest FILE is two levels up, exactly as manifest.mjs's own ROOT computes
+// it. This read `../workspace.yaml` until 2026-07-27 — i.e. `scripts/
+// workspace.yaml`, which cannot exist — so step 1 always returned null and the
+// documented "the manifest module is authoritative" order was a fiction. It
+// went unnoticed because step 2's walk up from cwd covers every in-tree
+// session; only out-of-tree callers felt it, and they silently got the
+// stale-able baked list instead.
 function require$(url) {
   try {
-    const src = readFileSync(new URL("../workspace.yaml", url), "utf8");
+    const src = readFileSync(new URL("../../workspace.yaml", url), "utf8");
     const m = src.match(/^\s*protected_repos:\s*\[([^\]]+)\]/m);
     return m ? m[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "").toLowerCase()).filter(Boolean) : null;
   } catch { return null; }
@@ -361,6 +409,17 @@ if (pushSeg) {
 }
 
 // ═══ 2. ASK — a human decision genuinely helps ═════════════════════════════
+
+// An unquoted heredoc expands substitutions before execution. Because its body
+// is scrubbed before path checks, fail closed here when the target is dynamic.
+if (heredocDynamic) {
+  ask(
+    `This heredoc's delimiter is unquoted, so bash expands its body (\`${heredocDynamic}\`) before the ` +
+    `command runs — that can read \`.env\` or a private key with no path argument for the secret gate ` +
+    `to check. Quote the delimiter (\`<<'EOF'\`) if no expansion is wanted; approve only if it is.`,
+  );
+}
+
 const SENSITIVE = [
   [/\.pdf$/i,                             "personal document (the class swept into #6)"],
   [/(^|\/)\.env(\.|$)/i,                  "environment file — secrets"],
