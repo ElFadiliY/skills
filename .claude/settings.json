@@ -50,7 +50,21 @@
       "Bash(gh issue view:*)",
       "Bash(npm run:*)",
       "Bash(npm ci:*)",
-      "Bash(npm test:*)"
+      "Bash(npm test:*)",
+      "Bash(rclone lsf:*)",
+      "Bash(rclone lsl:*)",
+      "Bash(rclone size:*)",
+      "Bash(vercel env ls:*)",
+      "Bash(vercel ls:*)",
+      "Bash(vercel project ls:*)",
+      "Bash(vercel domains ls:*)",
+      "Bash(vercel inspect:*)",
+      "Bash(unzip -l:*)",
+      "Bash(unzip -p:*)",
+      "Bash(shasum:*)",
+      "Bash(gh search:*)",
+      "mcp__neon__list_projects",
+      "mcp__supabase-all__list_projects"
     ]
   },
   "hooks": {
@@ -76,6 +90,11 @@
           {
             "type": "command",
             "command": "d=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}\"; [ -f \"$d/scripts/git-hygiene-report.sh\" ] && bash \"$d/scripts/git-hygiene-report.sh\" 2>/dev/null; true"
+          },
+          {
+            "type": "command",
+            "command": "d=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}\"; [ -f \"$d/scripts/handoff-report.sh\" ] && bash \"$d/scripts/handoff-report.sh\" 2>/dev/null; true",
+            "timeout": 10
           }
         ]
       }
