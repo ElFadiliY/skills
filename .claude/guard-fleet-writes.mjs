@@ -578,6 +578,48 @@ if (localSeg) {
   }
 }
 
+// ── `git worktree remove --force` — the one discard with no snapshot ───────
+// Every other destructive-but-recoverable command lands in the block above.
+// This one escaped it, and it is the worst of the set: it deletes the whole
+// worktree directory, untracked files included, and those exist in no branch,
+// no stash and no remote.
+//
+// Plain `worktree remove` is already safe — git refuses a dirty worktree with
+// "contains modified or untracked files, use --force to delete it". So the only
+// form that can lose work is the one where git's own guard is being overridden
+// explicitly. Snapshot that, then get out of the way, exactly as with
+// `reset --hard`.
+//
+// The undo ref lives in the shared ref store, not the worktree, so it survives
+// the removal it is protecting against.
+const wtSeg = segmentsFor("git").find((s) => /^git\s+(-C\s+\S+\s+)?worktree\s+remove\b/.test(s));
+if (wtSeg) {
+  const wt = wtSeg.split(/\s+/);
+  const forced = wt.some((t) => t === "-f" || t === "--force");
+  const ri = wt.indexOf("remove");
+  const target = wt.slice(ri + 1).find((t) => !t.startsWith("-"))?.replace(/^["']|["']$/g, "");
+  if (forced && target) {
+    const base = dirFor(wt);
+    const abs = target.startsWith("/") ? target : join(base, target);
+    // Only snapshot when there is something to lose; a clean worktree removal is
+    // routine tidying and should not pay 40ms or produce an undo ref.
+    if (existsSync(abs) && gitIn(abs, "status", "--porcelain")) {
+      const snap = snapshot(abs, "git worktree remove --force");
+      if (snap) {
+        allow(
+          `Snapshotted ${abs} to ${snap.ref} before \`git worktree remove --force\` — ` +
+          `untracked files included. Restore with \`npm run undo\`.`,
+        );
+      }
+      ask(
+        `\`git worktree remove --force\` would delete ${abs} including uncommitted and UNTRACKED ` +
+        `files, and the undo snapshot could not be written — so this would not be recoverable. ` +
+        `\`git -C ${abs} status --porcelain\` shows what would be lost.`,
+      );
+    }
+  }
+}
+
 // ═══ 4. ALLOW — provably read-only ═════════════════════════════════════════
 // Skips the permission prompt entirely, so this must be exact. Anything with a
 // redirect, command substitution, backticks or a subshell is disqualified
