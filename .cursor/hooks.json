@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "node \".cursor/guard-cursor-adapter.mjs\"",
+        "timeout": 10
+      }
+    ]
+  }
+}
