@@ -117,7 +117,14 @@ const splitSegments = (src) => {
 };
 
 const segments = (splitSegments(cmd) ?? cmd.split(SEP))
-  .map((s) => s.trim().replace(/^(?:[A-Za-z_]\w*=\S*\s+)*/, "")) // strip FOO=bar prefixes
+  .map((s) => s.trim()
+    .replace(/^(?:[A-Za-z_]\w*=\S*\s+)*/, "")          // strip FOO=bar prefixes
+    // …and leading shell keywords. `;` ends a segment, so the body of a
+    // compound command arrives as `do cat "$f"` / `then cat .env` and every
+    // check below reads `do`/`then` as the binary — `cat .env` asked, but
+    // `if true; then cat .env; fi` fell through to a generic prompt with the
+    // secret gate never consulted. Same for `{`/`(` subshell openers.
+    .replace(/^(?:(?:do|then|else|elif|while|until|if|\{|\()\s+)*/, ""))
   .filter(Boolean);
 const segmentsFor = (bin) => segments.filter((s) => s === bin || s.startsWith(`${bin} `));
 
@@ -794,11 +801,19 @@ for (const seg of segments) {
   // after shellUnquote could resolve to `.env`/a key — the exact obfuscation
   // this gate stops. Fail closed rather than let it reach the read-only `allow`
   // that skips the prompt entirely.
+  //
+  // The overwhelmingly common trigger is not obfuscation, it is an agent
+  // writing `for f in a b c; do cat "$f"; done` out of shell habit. That is a
+  // prompt with no security value on either side: the operator learns nothing
+  // from approving it, and the same read spelled literally is auto-allowed. So
+  // the message names the fix, the way the glob branch below already does —
+  // otherwise every session rediscovers the wall and nobody rediscovers the door.
   const dyn = cands.find((p) => DYNAMIC.test(p));
   if (dyn) {
     ask(
       `A path arg to \`${bin}\` expands at runtime (\`${dyn}\`), so it can't be checked against the ` +
-      `secret deny list — it may resolve to \`.env\` or a key. Approve only if you know it does not.`,
+      `secret deny list — it may resolve to \`.env\` or a key. Name the paths literally ` +
+      `(\`${bin} a b c\` reads them all in one auto-allowed call), or approve only if you know it does not.`,
     );
   }
   // PATHNAME expansion is the same hole by another route, and it was open:
