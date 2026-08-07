@@ -32,8 +32,8 @@
 // stops the accident and the autopilot, not a determined operator.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { join, dirname, resolve, sep } from "node:path";
 
 const read = async () => {
   const chunks = [];
@@ -653,11 +653,45 @@ const GIT_READ_UNSAFE = /^(remote\s+(add|remove|rm|set-url|rename|prune)|worktre
 
 const GH_READ = /^gh\s+(pr\s+(view|list|checks|diff|status)|run\s+(list|view|watch)|repo\s+(view|list)|issue\s+(view|list)|workflow\s+(list|view)|release\s+(view|list)|search|auth\s+status|label\s+list|cache\s+list|status)\b/;
 
-const NPM_READ = /^npm\s+run\s+(-s\s+|--silent\s+)?(doctor|validate|audit|lint|typecheck|test|brief|guard|secrets|drift|status|harvest|roadmap|dashboard|generate|tidy|undo)\b/;
+// `npm test` and `npm t` are npm's own aliases for `npm run test`, which is
+// already read here. The alias must not cost an approval the spelled-out form
+// does not — that difference is invisible from the operator's side and it was
+// worth 23 prompts in a 50-transcript sample.
+//
+// `check` covers the house's read-only checkers (`check:spacing`,
+// `check-memory-links`, `check:mapping-drift`, `check-brand-canon`, …), 113
+// calls in that same sample and the largest single Bash gap left. It is one
+// alternation entry rather than a `check.*` because the trailing `\b` is what
+// keeps it honest: `check` then `:` or `-` is a boundary and matches, while
+// `checkout-staging` is not a boundary and still falls through to a prompt.
+const NPM_READ = /^npm\s+(?:test|t|run\s+(?:-s\s+|--silent\s+)?(?:doctor|validate|audit|lint|typecheck|test|check|brief|guard|secrets|drift|status|harvest|roadmap|dashboard|generate|tidy|undo))\b/;
 
 const SHELL_READ = new Set(["ls", "cat", "head", "tail", "wc", "grep", "rg", "jq",
   "diff", "cmp", "file", "stat", "du", "df", "basename", "dirname", "realpath", "pwd", "echo",
   "printf", "sort", "uniq", "cut", "tr", "which", "type", "date", "true", "seq", "column", "tee"]);
+
+// npm resolves package.json from the cwd, so a preceding `cd` retargets it
+// exactly like `--prefix` does: `cd /tmp/evil && npm test` would run a foreign
+// `test` script under a read-only name. A plain relative hop (`cd packages/api`)
+// stays under the repo and keeps its allowance; an absolute path, a `..`, a
+// bare `cd`/`cd -`, or anything carrying expansion is an unknown destination.
+//
+// The path STRING is not enough: `ln -s /tmp/evil escape && cd escape` reads as
+// a tidy relative hop and lands outside the tree, so the destination is
+// realpath-resolved and required to sit under the repo root. Anything that
+// cannot be resolved (missing dir, unreadable, no git root) fails closed.
+const CD_INSIDE_REPO = /^cd\s+(?:\.\/)?(?![-/])[\w.@][\w.@/-]*$/;
+const BASE_DIR = payload?.cwd || process.cwd();
+const realOrNull = (p) => { try { return realpathSync(p); } catch { return null; } };
+const REPO_REAL = realOrNull(gitIn(BASE_DIR, "rev-parse", "--show-toplevel") || BASE_DIR);
+const cdStaysInRepo = (seg) => {
+  if (!CD_INSIDE_REPO.test(seg) || /(^|[\s/])\.\.(\/|$)/.test(seg)) return false;
+  if (!REPO_REAL) return false;
+  const dest = realOrNull(resolve(BASE_DIR, seg.slice(3).trim()));
+  return !!dest && (dest === REPO_REAL || dest.startsWith(REPO_REAL + sep));
+};
+const cdLeavesRepo = segments.some((s) =>
+  (s === "cd" || s.startsWith("cd ")) && !cdStaysInRepo(s));
 
 const isReadOnly = (seg) => {
   const t = seg.split(/\s+/);
@@ -671,7 +705,23 @@ const isReadOnly = (seg) => {
   // `sort -o FILE` / `sort -oFILE` / `sort --output` overwrites a file in place.
   if (bin === "sort") return !t.slice(1).some((a) => /^--output(=|$)/.test(a) || /^-[a-z]*o/.test(a));
   if (SHELL_READ.has(bin)) return bin !== "tee";              // tee writes — excluded
-  if (bin === "npm") return NPM_READ.test(seg);
+  if (bin === "npm") {
+    // The NPM_READ allowlist is only defensible for scripts in THIS repo's
+    // package.json. Retargeting flags (`--prefix`, `-C`, `--workspace`/`-w`)
+    // point npm at a foreign package.json, so `npm test --prefix /tmp/evil`
+    // would run arbitrary scripts under a read-only name. Prompt for those.
+    if (!NPM_READ.test(seg)) return false;
+    // The grant covers the BARE invocation only. Retargeting flags
+    // (`--prefix`, `-C`, `--workspace`/`-w`) point npm at a foreign
+    // package.json, and arguments handed to the script are ones no
+    // script-name allowlist can judge: `npm run check-layout-canon --
+    // --update-baseline` rewrites scripts/layout-canon-baseline.json under a
+    // name the `check` token reads as safe. Anything trailing prompts.
+    const extra = t.slice(t[1] === "run" ? (/^(-s|--silent)$/.test(t[2] ?? "") ? 4 : 3) : 2);
+    if (extra.length) return false;
+    if (cdLeavesRepo) return false;                           // cwd retargeting — same threat
+    return true;
+  }
   if (bin === "gh") {
     // Canonicalise away global flags (`-R o/r`, `--hostname …`) so a GET behind
     // them still reads as read-only. `gh api` is read-only only for a REST GET
