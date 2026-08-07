@@ -116,15 +116,31 @@ const splitSegments = (src) => {
   return quote ? null : out;
 };
 
+// An env-assignment prefix decides what a command actually runs, and it is
+// stripped just below before any check sees it: `npm_config_prefix=…` retargets
+// npm exactly like `--prefix`, `PATH=/tmp/evil` swaps the npm binary itself, and
+// `NODE_OPTIONS=--require=/tmp/x.js` / `LD_PRELOAD=…` inject code into it. No
+// allowlist of "safe" variable names is worth defending here, so remember every
+// segment that carried ANY assignment and let the npm grant fail closed on it.
+// (Found by Codesmith on the dentistry-lms rollout PR, generalising its own
+// narrower `npm_config_*` version — the broader rule is the cheaper one to
+// reason about, and this grant has already leaked through four separate
+// channels.)
+const envPrefixedSegments = new Set();
 const segments = (splitSegments(cmd) ?? cmd.split(SEP))
-  .map((s) => s.trim()
-    .replace(/^(?:[A-Za-z_]\w*=\S*\s+)*/, "")          // strip FOO=bar prefixes
-    // …and leading shell keywords. `;` ends a segment, so the body of a
-    // compound command arrives as `do cat "$f"` / `then cat .env` and every
-    // check below reads `do`/`then` as the binary — `cat .env` asked, but
-    // `if true; then cat .env; fi` fell through to a generic prompt with the
-    // secret gate never consulted. Same for `{`/`(` subshell openers.
-    .replace(/^(?:(?:do|then|else|elif|while|until|if|\{|\()\s+)*/, ""))
+  .map((s) => {
+    const raw = s.trim();
+    const stripped = raw
+      .replace(/^(?:[A-Za-z_]\w*=\S*\s+)*/, "")        // strip FOO=bar prefixes
+      // …and leading shell keywords. `;` ends a segment, so the body of a
+      // compound command arrives as `do cat "$f"` / `then cat .env` and every
+      // check below reads `do`/`then` as the binary — `cat .env` asked, but
+      // `if true; then cat .env; fi` fell through to a generic prompt with the
+      // secret gate never consulted. Same for `{`/`(` subshell openers.
+      .replace(/^(?:(?:do|then|else|elif|while|until|if|\{|\()\s+)*/, "");
+    if (/^[A-Za-z_]\w*=/.test(raw)) envPrefixedSegments.add(stripped);
+    return stripped;
+  })
   .filter(Boolean);
 const segmentsFor = (bin) => segments.filter((s) => s === bin || s.startsWith(`${bin} `));
 
@@ -779,6 +795,7 @@ const isReadOnly = (seg) => {
     const extra = bare.slice(bare[1] === "run" ? (/^(-s|--silent)$/.test(bare[2] ?? "") ? 4 : 3) : 2);
     if (extra.length) return false;
     if (cdLeavesRepo) return false;                           // cwd retargeting — same threat
+    if (envPrefixedSegments.has(seg)) return false;           // env retargeting — same threat
     return true;
   }
   if (bin === "gh") {
