@@ -653,7 +653,18 @@ const GIT_READ_UNSAFE = /^(remote\s+(add|remove|rm|set-url|rename|prune)|worktre
 
 const GH_READ = /^gh\s+(pr\s+(view|list|checks|diff|status)|run\s+(list|view|watch)|repo\s+(view|list)|issue\s+(view|list)|workflow\s+(list|view)|release\s+(view|list)|search|auth\s+status|label\s+list|cache\s+list|status)\b/;
 
-const NPM_READ = /^npm\s+run\s+(-s\s+|--silent\s+)?(doctor|validate|audit|lint|typecheck|test|brief|guard|secrets|drift|status|harvest|roadmap|dashboard|generate|tidy|undo)\b/;
+// `npm test` and `npm t` are npm's own aliases for `npm run test`, which is
+// already read here. The alias must not cost an approval the spelled-out form
+// does not — that difference is invisible from the operator's side and it was
+// worth 23 prompts in a 50-transcript sample.
+//
+// `check` covers the house's read-only checkers (`check:spacing`,
+// `check-memory-links`, `check:mapping-drift`, `check-brand-canon`, …), 113
+// calls in that same sample and the largest single Bash gap left. It is one
+// alternation entry rather than a `check.*` because the trailing `\b` is what
+// keeps it honest: `check` then `:` or `-` is a boundary and matches, while
+// `checkout-staging` is not a boundary and still falls through to a prompt.
+const NPM_READ = /^npm\s+(?:test|t|run\s+(?:-s\s+|--silent\s+)?(?:doctor|validate|audit|lint|typecheck|test|check|brief|guard|secrets|drift|status|harvest|roadmap|dashboard|generate|tidy|undo))\b/;
 
 const SHELL_READ = new Set(["ls", "cat", "head", "tail", "wc", "grep", "rg", "jq",
   "diff", "cmp", "file", "stat", "du", "df", "basename", "dirname", "realpath", "pwd", "echo",
