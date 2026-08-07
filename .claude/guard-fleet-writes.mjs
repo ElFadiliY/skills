@@ -691,63 +691,36 @@ const SHELL_READ = new Set(["ls", "cat", "head", "tail", "wc", "grep", "rg", "jq
 // exactly like `--prefix` does: `cd /tmp/evil && npm test` would run a foreign
 // `test` script under a read-only name.
 //
-// The first cut of this required the destination to sit UNDER the current repo
-// root, which was the wrong key. `cd <sibling repo> && npm run lint` is the
-// normal fleet shape — it was 34 auto-allows in a 50-transcript replay — and a
-// path prefix cannot tell that carwella is ours while /tmp/evil is not. So key
-// it on IDENTITY instead: the destination is fine if it is inside this repo, or
-// if it is a git repo whose `origin` is in the manifest. A symlink can forge a
-// path; it cannot forge a remote.
+// This grant is worth exactly one destination: THIS project's own tree. Two
+// wider cuts were tried and both leaked. Keying the cross-repo hop on IDENTITY
+// (any git repo whose `origin` slug is in the manifest) trusts a string read
+// out of the destination itself, and `.git/config` is a plain file — `git init
+// evil && git remote add origin …/Exiid-Labs/carwella.git` forges it in two
+// commands. Adding CONTAINMENT (that repo must also sit in the manifest's tree)
+// only moves the forge inside the tree, where the same planted `.git/` plus
+// `package.json` still passes. There is no non-forgeable binding available
+// here: the manifest names slugs, not checkout paths, so nothing in it can say
+// which directory is really carwella.
 //
-// Everything else fails closed — an unresolvable path, a non-repo, a repo not
-// in the manifest, a bare `cd`/`cd -`, or anything carrying expansion.
+// A sibling hop is worth auto-allows (34 in a 50-transcript replay) but it is
+// not worth a grant whose key any write can mint, so `cd <sibling> && npm test`
+// prompts again exactly as it did before this file existed. Everything except
+// a hop that stays inside this project fails closed — a sibling checkout, an
+// unresolvable path, a bare `cd`/`cd -`, or anything carrying expansion.
 const BASE_DIR = payload?.cwd || process.cwd();
 const realOrNull = (p) => { try { return realpathSync(p); } catch { return null; } };
 // "This repo" is the project that OWNS this hook, never wherever the tool
-// happens to be standing. Deriving it from `payload.cwd` — as the first two
-// cuts did, including the "strictly null when the cwd is not inside a repo"
-// one — made the in-repo grant FOLLOW the agent: a session already sitting in
-// a foreign tree got `npm test` auto-allowed there with no forged remote and
-// no manifest involved, because that tree was its own git toplevel. Being
-// strictly null covered the not-a-repo case and missed this one, and no
-// fixture caught it because every fixture set `cwd` to a repo we own.
-//
-// Bind it to CLAUDE_PROJECT_DIR when the runtime supplies one, else to the git
-// toplevel of THIS FILE's directory — a rolled-out copy lives at
-// <repo>/.claude/, so the toplevel is the repo it guards. Strictly null when
-// neither resolves, which forfeits the in-repo grant rather than guessing.
+// happens to be standing. Deriving it from `payload.cwd` made the in-repo grant
+// follow the agent: a session already sitting in /tmp/evil got `npm test` there
+// auto-allowed with no forged remote and no manifest involved, because that
+// tree was its own git toplevel. Bind it to CLAUDE_PROJECT_DIR when the runtime
+// supplies one, else to the git toplevel of THIS FILE's directory — a
+// rolled-out copy lives at <repo>/.claude/, so the toplevel is the repo it
+// guards. Strictly null when neither resolves, which forfeits the in-repo grant
+// rather than guessing at one.
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR || gitIn(HOOK_DIR, "rev-parse", "--show-toplevel");
 const REPO_REAL = PROJECT_DIR ? realOrNull(PROJECT_DIR) : null;
-
-// Every `repo: Owner/name` in workspace.yaml, by the same three-tier resolution
-// protectedSet() uses. No baked fallback here: a stale list of fleet repos would
-// GRANT reads in a repo that has left the fleet, where a stale protected list
-// only over-blocks. An unreadable manifest yields an empty set, which forfeits
-// the cross-repo grant and leaves the in-repo one intact.
-function fleetSlugs() {
-  const parse = (src) => new Set(
-    [...src.matchAll(/^\s*repo:\s*["']?([\w.@-]+\/[\w.@-]+)["']?/gm)].map((m) => m[1].toLowerCase()));
-  try {
-    const url = new URL("./lib/manifest.mjs", import.meta.url);
-    if (existsSync(url)) {
-      const s = parse(readFileSync(new URL("../../workspace.yaml", url), "utf8"));
-      if (s.size) return s;
-    }
-  } catch { /* fall through */ }
-  let d = BASE_DIR;
-  for (let i = 0; i < 6 && d && d !== "/"; i++) {
-    const y = join(d, "workspace.yaml");
-    if (existsSync(y)) {
-      try { const s = parse(readFileSync(y, "utf8")); if (s.size) return s; } catch { /* keep walking */ }
-    }
-    d = dirname(d);
-  }
-  return new Set();
-}
-let FLEET = null;
-const originSlug = (dir) => gitIn(dir, "remote", "get-url", "origin")
-  .replace(/\.git$/, "").split(/[/:]/).slice(-2).join("/").toLowerCase();
 
 const CD_TARGET = /^cd\s+("[^"]+"|'[^']+'|[^\s;&|]+)$/;
 // The literal destination of a `cd` segment, or null when it is not a single
@@ -760,30 +733,26 @@ const cdRawTarget = (seg) => {
   if (raw === "-" || raw === "~") return null;
   return raw.startsWith("~/") ? join(process.env.HOME || "~", raw.slice(2)) : raw;
 };
-// A directory npm may be pointed at: inside the project that owns this hook,
-// or a git repo whose `origin` is in the manifest.
-const dirIsAllowed = (dest) => {
-  if (!dest) return false;                                  // missing/unreadable — fail closed
-  if (REPO_REAL && (dest === REPO_REAL || dest.startsWith(REPO_REAL + sep))) return true;
-  const top = gitIn(dest, "rev-parse", "--show-toplevel");
-  if (!top) return false;                                   // not a git repo at all
-  FLEET ??= fleetSlugs();
-  return FLEET.has(originSlug(top));
-};
 const cdIsSafe = (seg) => {
   const raw = cdRawTarget(seg);
   if (raw === null) return false;
-  return dirIsAllowed(realOrNull(resolve(BASE_DIR, raw)));
+  const dest = realOrNull(resolve(BASE_DIR, raw));
+  if (!dest) return false;                                  // missing/unreadable — fail closed
+  if (!REPO_REAL) return false;                             // no project root — no grant
+  return dest === REPO_REAL || dest.startsWith(REPO_REAL + sep);
 };
 const cdLeavesRepo = segments.some((s) =>
   (s === "cd" || s.startsWith("cd ")) && !cdIsSafe(s));
 
-// `cdLeavesRepo` is vacuously false when the command carries no `cd` at all, so
-// on its own it never looks at where the tool is ALREADY standing — which is
-// how a foreign cwd walked straight through. Replay the `cd`s in order to get
-// the cwd npm will actually see (each one relative to the last, which a
-// per-segment check keyed on BASE_DIR also gets wrong for `cd a && cd b`) and
-// hold that directory to the same rule. Null on anything unresolvable.
+// Landing in an allowed repo is not enough: npm loads the NEAREST package.json
+// walking up from its cwd, so a hop into a nested package (`cd tmp-pkg && npm
+// test`, with tmp-pkg/package.json written by an earlier ungated tool call)
+// runs a foreign script under a read-only name without ever leaving the tree.
+// Resolve the cwd the `cd`s leave behind and require npm's effective local
+// prefix to be this project's OWN root package.json. That also covers the
+// no-`cd` case, where the tool's cwd alone already sits in a foreign tree. A
+// prefix below the root, a cwd outside the project, or anything unresolvable
+// fails closed.
 const cdEffectiveCwd = () => {
   let cur = realOrNull(BASE_DIR);
   for (const s of segments) {
@@ -794,6 +763,26 @@ const cdEffectiveCwd = () => {
     cur = realOrNull(resolve(cur, raw));
   }
   return cur;
+};
+const npmLocalPrefix = (start) => {
+  let dir = start;
+  for (;;) {
+    if (existsSync(join(dir, "package.json"))) return dir;
+    const up = dirname(dir);
+    if (up === dir) return null;
+    dir = up;
+  }
+};
+// Lazy: the npm branch is the only caller, and this costs a `rev-parse`.
+const npmPrefixIsRepoRoot = () => {
+  const cwd = cdEffectiveCwd();
+  if (!cwd) return false;
+  const prefix = npmLocalPrefix(cwd);
+  if (!prefix) return false;
+  const topRaw = gitIn(cwd, "rev-parse", "--show-toplevel");
+  const top = topRaw ? realOrNull(topRaw) : null;
+  if (!top || prefix !== top) return false;                 // nested package.json — not a root
+  return !!REPO_REAL && top === REPO_REAL;
 };
 
 const isReadOnly = (seg) => {
@@ -811,11 +800,11 @@ const isReadOnly = (seg) => {
   if (bin === "npm") {
     // Every check below reads the segment as literal text, so an expansion
     // makes the text a lie: `npm test${IFS}--prefix${IFS}/tmp/evil` is ONE
-    // whitespace-free token here and three words by the time bash runs it. The
-    // argv count, the retargeting-flag scan and the script-name match are all
-    // defeated by that — it auto-allowed arbitrary script execution under a
-    // read-only name — so an npm segment carrying any expansion or backtick is
-    // not statically knowable and gets no grant.
+    // whitespace-free token here and three words by the time bash runs it, and
+    // `npm test $FLAGS` hides whatever the variable holds. The argv count, the
+    // retargeting-flag scan and the script-name match are all defeated by that,
+    // so an npm segment carrying any expansion or backtick is not statically
+    // knowable and gets no grant.
     if (DYNAMIC.test(seg)) return false;
     // The NPM_READ allowlist is only defensible for scripts in THIS repo's
     // package.json. Retargeting flags (`--prefix`, `-C`, `--workspace`/`-w`)
@@ -842,7 +831,7 @@ const isReadOnly = (seg) => {
     const extra = bare.slice(bare[1] === "run" ? (/^(-s|--silent)$/.test(bare[2] ?? "") ? 4 : 3) : 2);
     if (extra.length) return false;
     if (cdLeavesRepo) return false;                           // cwd retargeting — same threat
-    if (!dirIsAllowed(cdEffectiveCwd())) return false;        // cwd ALREADY foreign — same threat
+    if (!npmPrefixIsRepoRoot()) return false;                 // nested package.json — same threat
     if (envPrefixedSegments.has(seg)) return false;           // env retargeting — same threat
     return true;
   }
