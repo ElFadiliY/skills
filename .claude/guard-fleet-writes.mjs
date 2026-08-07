@@ -237,7 +237,7 @@ const MAIN = /^(main|master)$/;
 const BAKED_PROTECTED = ["dentistry-lms", "billing-platform", "iqa-contributions", "dentistry-leads", "exiid-os", "carwella"];
 
 function protectedSet() {
-  // 1. Running inside exiid-ops: the manifest module is authoritative, and
+  // 1. Running inside cortex: the manifest module is authoritative, and
   //    deliberately independent of cwd — this file's own location fixes the
   //    root, so a session anywhere on the box gets the live protected set
   //    rather than the baked one. In a rolled-out copy (<repo>/.claude/) the
