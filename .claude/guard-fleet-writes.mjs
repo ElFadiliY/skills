@@ -717,7 +717,18 @@ const isReadOnly = (seg) => {
     // script-name allowlist can judge: `npm run check-layout-canon --
     // --update-baseline` rewrites scripts/layout-canon-baseline.json under a
     // name the `check` token reads as safe. Anything trailing prompts.
-    const extra = t.slice(t[1] === "run" ? (/^(-s|--silent)$/.test(t[2] ?? "") ? 4 : 3) : 2);
+    //
+    // A redirection is not an argument to the script, and `npm run lint 2>&1 |
+    // tail -20` is the single most common shape in the fleet. Counting `2>&1`
+    // as argv cost 113 auto-allows on bare `npm run lint`/`typecheck`/`test`
+    // in a 50-transcript replay — more than this whole grant gives back. Strip
+    // redirections with the same two shapes the global probe above already
+    // vetted, so what remains is genuinely argv. Any OTHER `>` has passed
+    // through that probe by now, so this cannot hide a file write.
+    const bare = seg.replace(/\d?>&\d/g, " ")
+      .replace(/\d?>>?\s*\/dev\/(null|stderr|stdout)\b/g, " ")
+      .split(/\s+/).filter(Boolean);
+    const extra = bare.slice(bare[1] === "run" ? (/^(-s|--silent)$/.test(bare[2] ?? "") ? 4 : 3) : 2);
     if (extra.length) return false;
     if (cdLeavesRepo) return false;                           // cwd retargeting — same threat
     return true;
