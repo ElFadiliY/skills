@@ -45,7 +45,7 @@ Currently: `business-model-lifecycle-auditor`.
 
 ## Fleet rules
 
-Part of the Exiid Labs workspace (`labs/` cluster); conventions in `exiid-ops/AGENTS.md`.
+Part of the Exiid Labs workspace (`labs/` cluster); conventions in `cortex/AGENTS.md`.
 
 - Branch → PR → merge. Never `git add -A`.
 - Fill `.github/PULL_REQUEST_TEMPLATE.md` — the summary is the review surface.
