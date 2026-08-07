@@ -15,6 +15,10 @@
 #   ./scripts/env.sh scan            keys used in code but not declared
 #   ./scripts/env.sh exec -- CMD     run CMD with this repo's env loaded
 #   ./scripts/env.sh path            print the target file
+#   ./scripts/env.sh import          bulk set: KEY=VALUE lines from stdin, e.g.
+#                                    pbpaste | ./scripts/env.sh import
+#                                    (--declare adds unknown names to .env.example,
+#                                    value-free; commit, then import again)
 #
 # Why it exists: the agent working with you cannot read or write .env files (its
 # permissions deny it, deliberately) and a key pasted into a chat is a key in a
@@ -261,6 +265,36 @@ ensure_ignored() {
   echo "${Y}!${N} $file was not gitignored — added it to .gitignore. ${D}Commit that change.${N}"
 }
 
+# One entry into the target file; the value never touches a command line. Sets
+# STORE_ACTION to added|updated. Callers have already validated the name, passed
+# the gates (allowlist, denylist) and run ensure_ignored — this is only the
+# write. Shared by set and import so the two paths can never drift apart.
+store_value() {
+  name="$1"; value="$2"
+  # Quote only when the value contains something a dotenv parser could misread.
+  # Plain API keys and URLs stay unquoted, which every parser here handles.
+  case "$value" in
+    *[!A-Za-z0-9._:/+=~@-]*) esc="${value//\'/\'\\\'\'}"; entry="$name='$esc'" ;;
+    *) entry="$name=$value" ;;
+  esac
+  touch "$TARGET"; chmod 600 "$TARGET"
+  if grep -qE "^[[:space:]]*(export[[:space:]]+)?${name}=" "$TARGET" 2>/dev/null; then
+    tmp="$(mktemp)"
+    # Rewrite the line without ever putting the value on a command line, where
+    # it would be visible in `ps` to every other process on the machine.
+    ENV_SH_NAME="$name" ENV_SH_ENTRY="$entry" awk '
+      BEGIN { name = ENVIRON["ENV_SH_NAME"]; entry = ENVIRON["ENV_SH_ENTRY"]; done = 0 }
+      $0 ~ "^[[:space:]]*(export[[:space:]]+)?" name "=" { if (!done) { print entry; done = 1 } ; next }
+      { print }
+    ' "$TARGET" > "$tmp" && mv "$tmp" "$TARGET"
+    chmod 600 "$TARGET"
+    STORE_ACTION="updated"
+  else
+    printf '%s\n' "$entry" >> "$TARGET"
+    STORE_ACTION="added"
+  fi
+}
+
 # ── commands ────────────────────────────────────────────────────────────────
 cmd_status() {
   pick_target
@@ -386,31 +420,136 @@ cmd_set() {
   # behind — a write with nothing to show for it.
   ensure_ignored "$TARGET" || return 1
 
-  # Quote only when the value contains something a dotenv parser could misread.
-  # Plain API keys and URLs stay unquoted, which every parser here handles.
-  case "$value" in
-    *[!A-Za-z0-9._:/+=~@-]*) esc="${value//\'/\'\\\'\'}"; entry="$name='$esc'" ;;
-    *) entry="$name=$value" ;;
-  esac
+  store_value "$name" "$value"
+  echo "${G}✓${N} $name $STORE_ACTION in $TARGET  ${D}$(describe "$value")${N}"
+  return 0
+}
 
-  touch "$TARGET"; chmod 600 "$TARGET"
-  if grep -qE "^[[:space:]]*(export[[:space:]]+)?${name}=" "$TARGET" 2>/dev/null; then
-    tmp="$(mktemp)"
-    # Rewrite the line without ever putting the value on a command line, where
-    # it would be visible in `ps` to every other process on the machine.
-    ENV_SH_NAME="$name" ENV_SH_ENTRY="$entry" awk '
-      BEGIN { name = ENVIRON["ENV_SH_NAME"]; entry = ENVIRON["ENV_SH_ENTRY"]; done = 0 }
-      $0 ~ "^[[:space:]]*(export[[:space:]]+)?" name "=" { if (!done) { print entry; done = 1 } ; next }
-      { print }
-    ' "$TARGET" > "$tmp" && mv "$tmp" "$TARGET"
-    chmod 600 "$TARGET"
-    action="updated"
-  else
-    printf '%s\n' "$entry" >> "$TARGET"
-    action="added"
+# Bulk set: KEY=VALUE lines from stdin, one gated write per declared key.
+# Exists for the seeding moment — a fresh clone, a clipboard holding every test
+# key at once — where per-key hidden prompts are exactly the friction that
+# tempts a paste into the chat instead. The pipe keeps values out of the
+# conversation, the transcript and shell history:
+#
+#   pbpaste | ./scripts/env.sh import
+#
+# Every line passes the same gates as set: strict identifier, the
+# process-control denylist, and the COMMITTED .env.example allowlist.
+# Undeclared names are skipped and listed; with --declare they are appended to
+# .env.example value-free instead — never a value for them in the same run, so
+# promoting a name into the allowlist still passes through a reviewable commit
+# (the invariant cmd_set's two branches establish). Line-based on purpose: a
+# multiline value is indistinguishable from a stray paste, so a line that is
+# not KEY=VALUE is counted and never printed.
+cmd_import() {
+  declare_new=0
+  for a in "$@"; do
+    case "$a" in
+      --declare) declare_new=1 ;;
+      *) echo "${R}✗${N} import reads KEY=VALUE lines from stdin and takes no other argument (got: $a)." >&2
+         echo "  ${D}Pipe it (pbpaste | ./scripts/env.sh import) or run it bare and paste at the hidden prompt.${N}" >&2
+         return 1 ;;
+    esac
+  done
+  pick_target
+
+  # Interactive use hides the paste the way set's prompt does; piped use reads
+  # stdin as-is. Either way the lines live in one variable and are echoed never.
+  input=""
+  if [ -t 0 ]; then
+    printf 'Paste KEY=VALUE lines for %s (input hidden). Finish with Ctrl-D:\n' "$(basename "$ROOT")"
+    old_stty="$(stty -g)"
+    trap 'stty "$old_stty" 2>/dev/null' EXIT INT TERM
+    stty -echo
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    input="$input$line
+"
+  done
+  if [ -t 0 ]; then stty "$old_stty"; trap - EXIT INT TERM; printf '\n'; fi
+
+  allowed="$(committed_keys)"
+  wt_declared="$(declared_keys)"
+  wrote=0; updated_n=0; unparsed=0; target_ready=0
+  skipped_undeclared=""; skipped_uncommitted=""; refused=""; empty_skipped=""; declared_now=""
+
+  # remember <list> <key>: echo the list with key appended once — no eval, so
+  # no path from parsed input back into the shell, however validated it looks.
+  remember() { case " $1 " in *" $2 "*) printf '%s' "$1" ;; *) printf '%s' "$1 $2" ;; esac; }
+
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in
+      export[[:space:]]*) line="${line#export}"; line="${line#"${line%%[![:space:]]*}"}" ;;
+    esac
+    case "$line" in *=*) : ;; *) unparsed=$((unparsed+1)); continue ;; esac
+    k="${line%%=*}"; v="${line#*=}"
+    k="${k%"${k##*[![:space:]]}"}"
+    case "$k" in ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) unparsed=$((unparsed+1)); continue ;; esac
+    if is_dangerous_name "$k"; then refused="$(remember "$refused" "$k")"; continue; fi
+    # strip one matching pair of surrounding quotes, the way exec reads them
+    case "$v" in
+      \"*\") v="${v#\"}"; v="${v%\"}" ;;
+      \'*\') v="${v#\'}"; v="${v%\'}" ;;
+    esac
+    if [ -z "$v" ]; then empty_skipped="$(remember "$empty_skipped" "$k")"; continue; fi
+    if ! printf '%s\n' "$allowed" | grep -Fxq -- "$k"; then
+      if printf '%s\n' "$wt_declared" | grep -Fxq -- "$k"; then
+        skipped_uncommitted="$(remember "$skipped_uncommitted" "$k")"
+      else
+        skipped_undeclared="$(remember "$skipped_undeclared" "$k")"
+      fi
+      continue
+    fi
+    # A paste of nothing but undeclared names must leave the tree untouched, so
+    # the gitignore check runs lazily, before the first write that will happen.
+    if [ "$target_ready" -eq 0 ]; then ensure_ignored "$TARGET" || return 1; target_ready=1; fi
+    store_value "$k" "$v"
+    [ "$STORE_ACTION" = "updated" ] && updated_n=$((updated_n+1))
+    wrote=$((wrote+1))
+    printf '  %s✓%s %-38s %s  %s%s%s\n' "$G" "$N" "$k" "$STORE_ACTION" "$D" "$(describe "$v")" "$N"
+  done <<EOF
+$input
+EOF
+
+  # --declare edits the contract only, exactly like set --declare: names in,
+  # no values, and the values for them land on a SECOND import after the commit.
+  if [ "$declare_new" -eq 1 ] && [ -n "$skipped_undeclared" ]; then
+    [ -f "$EXAMPLE" ] || printf '# Every env var this repo reads. No real values.\n' > "$EXAMPLE"
+    for k in $skipped_undeclared; do
+      printf '\n# TODO describe %s\n%s=\n' "$k" "$k" >> "$EXAMPLE"
+    done
+    declared_now="$skipped_undeclared"
+    skipped_undeclared=""
   fi
 
-  echo "${G}✓${N} $name $action in $TARGET  ${D}$(describe "$value")${N}"
+  echo ""
+  if [ "$wrote" -gt 0 ]; then
+    extra=""; [ "$updated_n" -gt 0 ] && extra=" ($updated_n updated in place)"
+    echo "  ${G}✓${N} $wrote key(s) written to $TARGET$extra"
+  fi
+  if [ -n "$declared_now" ]; then
+    echo "  ${Y}+${N} declared value-free in $EXAMPLE:$declared_now"
+    echo "    ${D}Describe each with a one-line comment, commit $EXAMPLE, then run the same import again for their values.${N}"
+  fi
+  if [ -n "$skipped_uncommitted" ]; then
+    echo "  ${Y}!${N} declared in $EXAMPLE but not committed — skipped:$skipped_uncommitted"
+    echo "    ${D}Commit that edit (it is reviewable), then run the import again.${N}"
+  fi
+  if [ -n "$skipped_undeclared" ]; then
+    echo "  ${Y}!${N} not declared in committed $EXAMPLE — skipped:$skipped_undeclared"
+    echo "    ${D}Re-run with --declare to add them value-free, then commit and import again.${N}"
+  fi
+  [ -n "$refused" ] && echo "  ${R}✗${N} process-control names refused (a value would run as code on exec):$refused"
+  [ -n "$empty_skipped" ] && echo "  ${Y}!${N} empty value — skipped:$empty_skipped"
+  [ "$unparsed" -gt 0 ] && echo "  ${D}$unparsed line(s) were not KEY=VALUE — ignored, never printed (multiline values are unsupported).${N}"
+  if [ "$wrote" -eq 0 ] && [ -z "$declared_now$skipped_uncommitted$skipped_undeclared$refused$empty_skipped" ] && [ "$unparsed" -eq 0 ]; then
+    echo "  ${Y}!${N} no KEY=VALUE lines found on stdin."
+  fi
+  echo "  ${D}Confirm with: ./scripts/env.sh   ·   gate with: ./scripts/env.sh check${N}"
+  echo ""
   return 0
 }
 
@@ -566,6 +705,9 @@ usage: ./scripts/env.sh [command]
   scan            env vars read in code but not declared in .env.example
   exec -- CMD     run CMD with this repo's env loaded
   path            print the target file
+  import          bulk set: KEY=VALUE lines from stdin, same gates as set
+                  (pbpaste | ./scripts/env.sh import); undeclared names are
+                  skipped — --declare appends them to .env.example value-free
 
 Values live only in this repo. Nothing is shared between repos but this script.
 USAGE
@@ -585,6 +727,7 @@ reject_extra() {
 case "${1:-status}" in
   status|"")  cmd_status ;;
   set)        shift; cmd_set "$@" ;;
+  import)     shift; cmd_import "$@" ;;
   unset)      shift; reject_extra unset $# && cmd_unset "${1:-}" ;;
   check)      cmd_check ;;
   scan)       cmd_scan ;;
