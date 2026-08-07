@@ -682,7 +682,14 @@ const isReadOnly = (seg) => {
   // `sort -o FILE` / `sort -oFILE` / `sort --output` overwrites a file in place.
   if (bin === "sort") return !t.slice(1).some((a) => /^--output(=|$)/.test(a) || /^-[a-z]*o/.test(a));
   if (SHELL_READ.has(bin)) return bin !== "tee";              // tee writes — excluded
-  if (bin === "npm") return NPM_READ.test(seg);
+  if (bin === "npm") {
+    // The NPM_READ allowlist is only defensible for scripts in THIS repo's
+    // package.json. Retargeting flags (`--prefix`, `-C`, `--workspace`/`-w`)
+    // point npm at a foreign package.json, so `npm test --prefix /tmp/evil`
+    // would run arbitrary scripts under a read-only name. Prompt for those.
+    if (/(^|\s)(--prefix|--workspace|-w|-C)(=|\s|$)/.test(seg)) return false;
+    return NPM_READ.test(seg);
+  }
   if (bin === "gh") {
     // Canonicalise away global flags (`-R o/r`, `--hostname …`) so a GET behind
     // them still reads as read-only. `gh api` is read-only only for a REST GET
