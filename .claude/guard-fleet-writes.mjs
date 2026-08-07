@@ -32,8 +32,8 @@
 // stops the accident and the autopilot, not a determined operator.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { join, dirname, resolve, sep } from "node:path";
 
 const read = async () => {
   const chunks = [];
@@ -116,15 +116,31 @@ const splitSegments = (src) => {
   return quote ? null : out;
 };
 
+// An env-assignment prefix decides what a command actually runs, and it is
+// stripped just below before any check sees it: `npm_config_prefix=…` retargets
+// npm exactly like `--prefix`, `PATH=/tmp/evil` swaps the npm binary itself, and
+// `NODE_OPTIONS=--require=/tmp/x.js` / `LD_PRELOAD=…` inject code into it. No
+// allowlist of "safe" variable names is worth defending here, so remember every
+// segment that carried ANY assignment and let the npm grant fail closed on it.
+// (Found by Codesmith on the dentistry-lms rollout PR, generalising its own
+// narrower `npm_config_*` version — the broader rule is the cheaper one to
+// reason about, and this grant has already leaked through four separate
+// channels.)
+const envPrefixedSegments = new Set();
 const segments = (splitSegments(cmd) ?? cmd.split(SEP))
-  .map((s) => s.trim()
-    .replace(/^(?:[A-Za-z_]\w*=\S*\s+)*/, "")          // strip FOO=bar prefixes
-    // …and leading shell keywords. `;` ends a segment, so the body of a
-    // compound command arrives as `do cat "$f"` / `then cat .env` and every
-    // check below reads `do`/`then` as the binary — `cat .env` asked, but
-    // `if true; then cat .env; fi` fell through to a generic prompt with the
-    // secret gate never consulted. Same for `{`/`(` subshell openers.
-    .replace(/^(?:(?:do|then|else|elif|while|until|if|\{|\()\s+)*/, ""))
+  .map((s) => {
+    const raw = s.trim();
+    const stripped = raw
+      .replace(/^(?:[A-Za-z_]\w*=\S*\s+)*/, "")        // strip FOO=bar prefixes
+      // …and leading shell keywords. `;` ends a segment, so the body of a
+      // compound command arrives as `do cat "$f"` / `then cat .env` and every
+      // check below reads `do`/`then` as the binary — `cat .env` asked, but
+      // `if true; then cat .env; fi` fell through to a generic prompt with the
+      // secret gate never consulted. Same for `{`/`(` subshell openers.
+      .replace(/^(?:(?:do|then|else|elif|while|until|if|\{|\()\s+)*/, "");
+    if (/^[A-Za-z_]\w*=/.test(raw)) envPrefixedSegments.add(stripped);
+    return stripped;
+  })
   .filter(Boolean);
 const segmentsFor = (bin) => segments.filter((s) => s === bin || s.startsWith(`${bin} `));
 
@@ -653,11 +669,93 @@ const GIT_READ_UNSAFE = /^(remote\s+(add|remove|rm|set-url|rename|prune)|worktre
 
 const GH_READ = /^gh\s+(pr\s+(view|list|checks|diff|status)|run\s+(list|view|watch)|repo\s+(view|list)|issue\s+(view|list)|workflow\s+(list|view)|release\s+(view|list)|search|auth\s+status|label\s+list|cache\s+list|status)\b/;
 
-const NPM_READ = /^npm\s+run\s+(-s\s+|--silent\s+)?(doctor|validate|audit|lint|typecheck|test|brief|guard|secrets|drift|status|harvest|roadmap|dashboard|generate|tidy|undo)\b/;
+// `npm test` and `npm t` are npm's own aliases for `npm run test`, which is
+// already read here. The alias must not cost an approval the spelled-out form
+// does not — that difference is invisible from the operator's side and it was
+// worth 23 prompts in a 50-transcript sample.
+//
+// `check` covers the house's read-only checkers (`check:spacing`,
+// `check-memory-links`, `check:mapping-drift`, `check-brand-canon`, …), 113
+// calls in that same sample and the largest single Bash gap left. It is one
+// alternation entry rather than a `check.*` because the trailing `\b` is what
+// keeps it honest: `check` then `:` or `-` is a boundary and matches, while
+// `checkout-staging` is not a boundary and still falls through to a prompt.
+const NPM_READ = /^npm\s+(?:test|t|run\s+(?:-s\s+|--silent\s+)?(?:doctor|validate|audit|lint|typecheck|test|check|brief|guard|secrets|drift|status|harvest|roadmap|dashboard|generate|tidy|undo))\b/;
 
 const SHELL_READ = new Set(["ls", "cat", "head", "tail", "wc", "grep", "rg", "jq",
   "diff", "cmp", "file", "stat", "du", "df", "basename", "dirname", "realpath", "pwd", "echo",
   "printf", "sort", "uniq", "cut", "tr", "which", "type", "date", "true", "seq", "column", "tee"]);
+
+// npm resolves package.json from the cwd, so a preceding `cd` retargets it
+// exactly like `--prefix` does: `cd /tmp/evil && npm test` would run a foreign
+// `test` script under a read-only name.
+//
+// The first cut of this required the destination to sit UNDER the current repo
+// root, which was the wrong key. `cd <sibling repo> && npm run lint` is the
+// normal fleet shape — it was 34 auto-allows in a 50-transcript replay — and a
+// path prefix cannot tell that carwella is ours while /tmp/evil is not. So key
+// it on IDENTITY instead: the destination is fine if it is inside this repo, or
+// if it is a git repo whose `origin` is in the manifest. A symlink can forge a
+// path; it cannot forge a remote.
+//
+// Everything else fails closed — an unresolvable path, a non-repo, a repo not
+// in the manifest, a bare `cd`/`cd -`, or anything carrying expansion.
+const BASE_DIR = payload?.cwd || process.cwd();
+const realOrNull = (p) => { try { return realpathSync(p); } catch { return null; } };
+// Strictly null when the cwd is not inside a repo. Falling back to BASE_DIR
+// there made every sibling directory count as "inside this repo", which handed
+// the grant to `cd ../anything` from any scratch dir — caught by the non-fleet
+// fixture, which sits under the same tmpdir as the fleet ones.
+const REPO_TOP = gitIn(BASE_DIR, "rev-parse", "--show-toplevel");
+const REPO_REAL = REPO_TOP ? realOrNull(REPO_TOP) : null;
+
+// Every `repo: Owner/name` in workspace.yaml, by the same three-tier resolution
+// protectedSet() uses. No baked fallback here: a stale list of fleet repos would
+// GRANT reads in a repo that has left the fleet, where a stale protected list
+// only over-blocks. An unreadable manifest yields an empty set, which forfeits
+// the cross-repo grant and leaves the in-repo one intact.
+function fleetSlugs() {
+  const parse = (src) => new Set(
+    [...src.matchAll(/^\s*repo:\s*["']?([\w.@-]+\/[\w.@-]+)["']?/gm)].map((m) => m[1].toLowerCase()));
+  try {
+    const url = new URL("./lib/manifest.mjs", import.meta.url);
+    if (existsSync(url)) {
+      const s = parse(readFileSync(new URL("../../workspace.yaml", url), "utf8"));
+      if (s.size) return s;
+    }
+  } catch { /* fall through */ }
+  let d = BASE_DIR;
+  for (let i = 0; i < 6 && d && d !== "/"; i++) {
+    const y = join(d, "workspace.yaml");
+    if (existsSync(y)) {
+      try { const s = parse(readFileSync(y, "utf8")); if (s.size) return s; } catch { /* keep walking */ }
+    }
+    d = dirname(d);
+  }
+  return new Set();
+}
+let FLEET = null;
+const originSlug = (dir) => gitIn(dir, "remote", "get-url", "origin")
+  .replace(/\.git$/, "").split(/[/:]/).slice(-2).join("/").toLowerCase();
+
+const CD_TARGET = /^cd\s+("[^"]+"|'[^']+'|[^\s;&|]+)$/;
+const cdIsSafe = (seg) => {
+  if (DYNAMIC.test(seg)) return false;                      // `cd $DIR` — unknowable
+  const m = seg.match(CD_TARGET);
+  if (!m) return false;                                     // bare `cd`, `cd -`, extra args
+  let raw = m[1].replace(/^["']|["']$/g, "");
+  if (raw === "-" || raw === "~") return false;
+  if (raw.startsWith("~/")) raw = join(process.env.HOME || "~", raw.slice(2));
+  const dest = realOrNull(resolve(BASE_DIR, raw));
+  if (!dest) return false;                                  // missing/unreadable — fail closed
+  if (REPO_REAL && (dest === REPO_REAL || dest.startsWith(REPO_REAL + sep))) return true;
+  const top = gitIn(dest, "rev-parse", "--show-toplevel");
+  if (!top) return false;                                   // not a git repo at all
+  FLEET ??= fleetSlugs();
+  return FLEET.has(originSlug(top));
+};
+const cdLeavesRepo = segments.some((s) =>
+  (s === "cd" || s.startsWith("cd ")) && !cdIsSafe(s));
 
 const isReadOnly = (seg) => {
   const t = seg.split(/\s+/);
@@ -671,7 +769,35 @@ const isReadOnly = (seg) => {
   // `sort -o FILE` / `sort -oFILE` / `sort --output` overwrites a file in place.
   if (bin === "sort") return !t.slice(1).some((a) => /^--output(=|$)/.test(a) || /^-[a-z]*o/.test(a));
   if (SHELL_READ.has(bin)) return bin !== "tee";              // tee writes — excluded
-  if (bin === "npm") return NPM_READ.test(seg);
+  if (bin === "npm") {
+    // The NPM_READ allowlist is only defensible for scripts in THIS repo's
+    // package.json. Retargeting flags (`--prefix`, `-C`, `--workspace`/`-w`)
+    // point npm at a foreign package.json, so `npm test --prefix /tmp/evil`
+    // would run arbitrary scripts under a read-only name. Prompt for those.
+    if (!NPM_READ.test(seg)) return false;
+    // The grant covers the BARE invocation only. Retargeting flags
+    // (`--prefix`, `-C`, `--workspace`/`-w`) point npm at a foreign
+    // package.json, and arguments handed to the script are ones no
+    // script-name allowlist can judge: `npm run check-layout-canon --
+    // --update-baseline` rewrites scripts/layout-canon-baseline.json under a
+    // name the `check` token reads as safe. Anything trailing prompts.
+    //
+    // A redirection is not an argument to the script, and `npm run lint 2>&1 |
+    // tail -20` is the single most common shape in the fleet. Counting `2>&1`
+    // as argv cost 113 auto-allows on bare `npm run lint`/`typecheck`/`test`
+    // in a 50-transcript replay — more than this whole grant gives back. Strip
+    // redirections with the same two shapes the global probe above already
+    // vetted, so what remains is genuinely argv. Any OTHER `>` has passed
+    // through that probe by now, so this cannot hide a file write.
+    const bare = seg.replace(/\d?>&\d/g, " ")
+      .replace(/\d?>>?\s*\/dev\/(null|stderr|stdout)\b/g, " ")
+      .split(/\s+/).filter(Boolean);
+    const extra = bare.slice(bare[1] === "run" ? (/^(-s|--silent)$/.test(bare[2] ?? "") ? 4 : 3) : 2);
+    if (extra.length) return false;
+    if (cdLeavesRepo) return false;                           // cwd retargeting — same threat
+    if (envPrefixedSegments.has(seg)) return false;           // env retargeting — same threat
+    return true;
+  }
   if (bin === "gh") {
     // Canonicalise away global flags (`-R o/r`, `--hostname …`) so a GET behind
     // them still reads as read-only. `gh api` is read-only only for a REST GET
