@@ -2,7 +2,7 @@
 
 Every key this repo needs lives **in this repo**. Nothing is shared with the other Exiid
 Labs repos except the script below — no central store, no keyring. Full convention:
-`exiid-ops/docs/ENV-CONVENTION.md`.
+`cortex/docs/ENV-CONVENTION.md`.
 
 ```bash
 ./scripts/env.sh                          # declared / set / missing (never a value)

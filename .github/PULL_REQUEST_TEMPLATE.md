@@ -11,9 +11,10 @@
 - [ ] verified in the running app (if user-facing)
 
 ## Risk & rollback
-<!-- Blast radius, migration/data impact, how to revert. exiid-ops is off the wire — call out any change that could affect a protected repo's CI. -->
+<!-- Blast radius, migration/data impact, how to revert. cortex is off the wire — call out any change that could affect a protected repo's CI. -->
 
 ## Checklist
 - [ ] Scope is focused — no unrelated changes
 - [ ] No secrets or keys committed
 - [ ] Follows repo conventions (AGENTS.md)
+- [ ] If closing a handoff: body includes `Fixes Owner/repo#N` or `Closes #N`
