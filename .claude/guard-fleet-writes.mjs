@@ -672,26 +672,74 @@ const SHELL_READ = new Set(["ls", "cat", "head", "tail", "wc", "grep", "rg", "jq
 
 // npm resolves package.json from the cwd, so a preceding `cd` retargets it
 // exactly like `--prefix` does: `cd /tmp/evil && npm test` would run a foreign
-// `test` script under a read-only name. A plain relative hop (`cd packages/api`)
-// stays under the repo and keeps its allowance; an absolute path, a `..`, a
-// bare `cd`/`cd -`, or anything carrying expansion is an unknown destination.
+// `test` script under a read-only name.
 //
-// The path STRING is not enough: `ln -s /tmp/evil escape && cd escape` reads as
-// a tidy relative hop and lands outside the tree, so the destination is
-// realpath-resolved and required to sit under the repo root. Anything that
-// cannot be resolved (missing dir, unreadable, no git root) fails closed.
-const CD_INSIDE_REPO = /^cd\s+(?:\.\/)?(?![-/])[\w.@][\w.@/-]*$/;
+// The first cut of this required the destination to sit UNDER the current repo
+// root, which was the wrong key. `cd <sibling repo> && npm run lint` is the
+// normal fleet shape — it was 34 auto-allows in a 50-transcript replay — and a
+// path prefix cannot tell that carwella is ours while /tmp/evil is not. So key
+// it on IDENTITY instead: the destination is fine if it is inside this repo, or
+// if it is a git repo whose `origin` is in the manifest. A symlink can forge a
+// path; it cannot forge a remote.
+//
+// Everything else fails closed — an unresolvable path, a non-repo, a repo not
+// in the manifest, a bare `cd`/`cd -`, or anything carrying expansion.
 const BASE_DIR = payload?.cwd || process.cwd();
 const realOrNull = (p) => { try { return realpathSync(p); } catch { return null; } };
-const REPO_REAL = realOrNull(gitIn(BASE_DIR, "rev-parse", "--show-toplevel") || BASE_DIR);
-const cdStaysInRepo = (seg) => {
-  if (!CD_INSIDE_REPO.test(seg) || /(^|[\s/])\.\.(\/|$)/.test(seg)) return false;
-  if (!REPO_REAL) return false;
-  const dest = realOrNull(resolve(BASE_DIR, seg.slice(3).trim()));
-  return !!dest && (dest === REPO_REAL || dest.startsWith(REPO_REAL + sep));
+// Strictly null when the cwd is not inside a repo. Falling back to BASE_DIR
+// there made every sibling directory count as "inside this repo", which handed
+// the grant to `cd ../anything` from any scratch dir — caught by the non-fleet
+// fixture, which sits under the same tmpdir as the fleet ones.
+const REPO_TOP = gitIn(BASE_DIR, "rev-parse", "--show-toplevel");
+const REPO_REAL = REPO_TOP ? realOrNull(REPO_TOP) : null;
+
+// Every `repo: Owner/name` in workspace.yaml, by the same three-tier resolution
+// protectedSet() uses. No baked fallback here: a stale list of fleet repos would
+// GRANT reads in a repo that has left the fleet, where a stale protected list
+// only over-blocks. An unreadable manifest yields an empty set, which forfeits
+// the cross-repo grant and leaves the in-repo one intact.
+function fleetSlugs() {
+  const parse = (src) => new Set(
+    [...src.matchAll(/^\s*repo:\s*["']?([\w.@-]+\/[\w.@-]+)["']?/gm)].map((m) => m[1].toLowerCase()));
+  try {
+    const url = new URL("./lib/manifest.mjs", import.meta.url);
+    if (existsSync(url)) {
+      const s = parse(readFileSync(new URL("../../workspace.yaml", url), "utf8"));
+      if (s.size) return s;
+    }
+  } catch { /* fall through */ }
+  let d = BASE_DIR;
+  for (let i = 0; i < 6 && d && d !== "/"; i++) {
+    const y = join(d, "workspace.yaml");
+    if (existsSync(y)) {
+      try { const s = parse(readFileSync(y, "utf8")); if (s.size) return s; } catch { /* keep walking */ }
+    }
+    d = dirname(d);
+  }
+  return new Set();
+}
+let FLEET = null;
+const originSlug = (dir) => gitIn(dir, "remote", "get-url", "origin")
+  .replace(/\.git$/, "").split(/[/:]/).slice(-2).join("/").toLowerCase();
+
+const CD_TARGET = /^cd\s+("[^"]+"|'[^']+'|[^\s;&|]+)$/;
+const cdIsSafe = (seg) => {
+  if (DYNAMIC.test(seg)) return false;                      // `cd $DIR` — unknowable
+  const m = seg.match(CD_TARGET);
+  if (!m) return false;                                     // bare `cd`, `cd -`, extra args
+  let raw = m[1].replace(/^["']|["']$/g, "");
+  if (raw === "-" || raw === "~") return false;
+  if (raw.startsWith("~/")) raw = join(process.env.HOME || "~", raw.slice(2));
+  const dest = realOrNull(resolve(BASE_DIR, raw));
+  if (!dest) return false;                                  // missing/unreadable — fail closed
+  if (REPO_REAL && (dest === REPO_REAL || dest.startsWith(REPO_REAL + sep))) return true;
+  const top = gitIn(dest, "rev-parse", "--show-toplevel");
+  if (!top) return false;                                   // not a git repo at all
+  FLEET ??= fleetSlugs();
+  return FLEET.has(originSlug(top));
 };
 const cdLeavesRepo = segments.some((s) =>
-  (s === "cd" || s.startsWith("cd ")) && !cdStaysInRepo(s));
+  (s === "cd" || s.startsWith("cd ")) && !cdIsSafe(s));
 
 const isReadOnly = (seg) => {
   const t = seg.split(/\s+/);
